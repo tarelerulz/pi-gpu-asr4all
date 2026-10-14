@@ -1,0 +1,43 @@
+#version 450
+// Depthwise 1-D conv on a channels-last input: 4 channels (vec4) x 4 consecutive outputs per thread.
+// out[c][t] = epi(bias[c] + sum_j W[j][c] * X[t*S + j*D - pad][c])   (X outside [0,Tin) = 0)
+// u: 0 C 1 Tout 2 Kw 3 S 4 D 5 pad 6 Tin | 7 X (row t at X + t*sXt, sXt % 4 == 0) 8 sXt | 9 W ([Kw][C])
+//    10 bias ([C]) | 11 out, 12 sOc, 13 sOt | 14 epi | 15 out channels-last (1: out[t][c] vec4)
+// 256-thread groups: 2026-10-13 sweep, 64 -> 256 took a step 568 -> 524 ms (A4A_LS in a4a_gpu.py must match)
+layout(local_size_x = 256) in;
+#include "common.glsl"
+void main() {
+    uint C4 = p.u[0] / 4u, T = p.u[1], q4 = (T + 3u) / 4u, i = tid();
+    if (i >= C4 * q4) return;
+    uint c4 = i % C4, t0 = (i / C4) * 4u;              // neighbours = neighbouring channels (same rows)
+    int S = int(p.u[3]), D = int(p.u[4]), Tin = int(p.u[6]), xr = int(p.u[8]) / 4;
+    int xb = int(p.u[7]) / 4 + int(c4);
+    uint wb = p.u[9] / 4u + c4;
+    vec4 b = w4[p.u[10] / 4u + c4];
+    vec4 s0 = b, s1 = b, s2 = b, s3 = b;
+    int tt = int(t0) * S - int(p.u[5]);
+    for (uint j = 0u; j < p.u[2]; j++) {
+        vec4 wv = w4[wb + j * C4];
+        if (tt >= 0 && tt < Tin) s0 += wv * a4[xb + tt * xr];
+        if (tt + S >= 0 && tt + S < Tin) s1 += wv * a4[xb + (tt + S) * xr];
+        if (tt + 2 * S >= 0 && tt + 2 * S < Tin) s2 += wv * a4[xb + (tt + 2 * S) * xr];
+        if (tt + 3 * S >= 0 && tt + 3 * S < Tin) s3 += wv * a4[xb + (tt + 3 * S) * xr];
+        tt += D;
+    }
+    uint op = p.u[14];
+    s0 = epi4(s0, op); s1 = epi4(s1, op); s2 = epi4(s2, op); s3 = epi4(s3, op);
+    int ob = int(p.u[11]), sOc = int(p.u[12]), sOt = int(p.u[13]);
+    if (p.u[15] == 1u) {                                 // channels-last output: vec4 stores
+        int o = ob / 4 + int(c4) + int(t0) * (sOt / 4);
+        a4[o] = s0;
+        if (t0 + 1u < T) a4[o + sOt / 4] = s1;
+        if (t0 + 2u < T) a4[o + 2 * (sOt / 4)] = s2;
+        if (t0 + 3u < T) a4[o + 3 * (sOt / 4)] = s3;
+    } else {
+        int o = ob + int(c4 * 4u) * sOc + int(t0) * sOt;
+#define ROW(k, v) { int oo = o + k * sOc; a[oo] = v.x; if (t0 + 1u < T) a[oo + sOt] = v.y; \
+        if (t0 + 2u < T) a[oo + 2 * sOt] = v.z; if (t0 + 3u < T) a[oo + 3 * sOt] = v.w; }
+        ROW(0, vec4(s0.x, s1.x, s2.x, s3.x)) ROW(1, vec4(s0.y, s1.y, s2.y, s3.y))
+        ROW(2, vec4(s0.z, s1.z, s2.z, s3.z)) ROW(3, vec4(s0.w, s1.w, s2.w, s3.w))
+    }
+}

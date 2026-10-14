@@ -1,0 +1,21 @@
+#version 450
+// Softmax / log-softmax along one axis; one row per thread. Other dims: 3-D shape.
+// u: 0-2 shape | 3 L | 4 X, 5-7 strides, 8 axis stride | 9 out, 10-12 strides, 13 axis stride | 14 mode (1 = log)
+// 256-thread groups: 2026-10-13 sweep, 64 -> 256 took a step 568 -> 524 ms (A4A_LS in a4a_gpu.py must match)
+layout(local_size_x = 256) in;
+#include "common.glsl"
+#define LDA(base, idx) a[int(base) + (idx)]
+void main() {
+    uint n1 = p.u[1], n2 = p.u[2], i = tid();
+    if (i >= p.u[0] * n1 * n2) return;
+    uint i2 = i % n2, r = i / n2, i1 = r % n1, i0 = r / n1, L = p.u[3];
+    int xb = int(i0) * int(p.u[5]) + int(i1) * int(p.u[6]) + int(i2) * int(p.u[7]), xs = int(p.u[8]);
+    int ob = int(p.u[9]) + int(i0) * int(p.u[10]) + int(i1) * int(p.u[11]) + int(i2) * int(p.u[12]), os = int(p.u[13]);
+    uint X = p.u[4];
+    float m = -3.4e38;
+    for (uint j = 0u; j < L; j++) m = max(m, LDA(X, xb + int(j) * xs));
+    float s = 0.0;
+    for (uint j = 0u; j < L; j++) s += exp(LDA(X, xb + int(j) * xs) - m);
+    if (p.u[14] == 1u) { float ls = log(s) + m; for (uint j = 0u; j < L; j++) a[ob + int(j) * os] = LDA(X, xb + int(j) * xs) - ls; }
+    else { float inv = 1.0 / s; for (uint j = 0u; j < L; j++) a[ob + int(j) * os] = exp(LDA(X, xb + int(j) * xs) - m) * inv; }
+}

@@ -1,0 +1,16 @@
+#version 450
+// out[h][d][t] = sum_k P[h][t] (term k) * V[h][d][t] (term k); terms are equally spaced in memory:
+// term k reads P at Pbase + k*dP and V at Vbase + k*dV (the attention "weighted sum of 15 shifted windows").
+// u: 0 H 1 Dd 2 T 3 count | 4 P, 5 sPh, 6 sPt, 7 dP | 8 V, 9 sVh, 10 sVd, 11 sVt, 12 dV | 13 out, 14 sOh, 15 sOd, 16 sOt
+layout(local_size_x = 256) in;
+#include "common.glsl"
+#define S(k) int(p.u[k])
+void main() {
+    uint T = p.u[2], Dd = p.u[1], i = tid();
+    if (i >= p.u[0] * Dd * T) return;
+    uint t = i % T, r = i / T, d = r % Dd, h = r / Dd;
+    int pi = S(4) + int(h) * S(5) + int(t) * S(6), vi = S(8) + int(h) * S(9) + int(d) * S(10) + int(t) * S(11);
+    float s = 0.0;
+    for (uint k = 0u; k < p.u[3]; k++) { s += a[pi] * a[vi]; pi += S(7); vi += S(12); }
+    a[S(13) + int(h) * S(14) + int(d) * S(15) + int(t) * S(16)] = s;
+}

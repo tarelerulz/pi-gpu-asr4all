@@ -1,0 +1,55 @@
+#version 450
+// out[m][n] = epi(bias[n] + sum_k A[m][k] * W[k][n]); 12 n x 4 m per thread. A strided (arena or weights),
+// W = weights [K][NP] (NP multiple of 12, vec4-aligned), out strided.
+// OV4: 0 scalar stores, 1 vec4 along m, 2 vec4 along n.
+// u: 0 M 1 N 2 K 3 NP | 4 A, 5 sAm, 6 sAk | 7 W | 8 bias (0xffffffff = none) | 9 out, 10 sOm, 11 sOn | 12 epi
+layout(local_size_x = 256) in;
+#include "common.glsl"
+#define LDA(base, idx) a[int(base) + (idx)]
+#define ACC(j, wv, c) s##j += wv.c * x;
+void main() {
+    uint M = p.u[0], N = p.u[1], K = p.u[2], NP = p.u[3], q4 = (M + 3u) / 4u, i = tid();
+    if (i >= (NP / 12u) * q4) return;
+    uint cg = i / q4, q = i % q4, m0 = q * 4u;
+    int sAm = int(p.u[5]), sAk = int(p.u[6]);
+    uint Ab = p.u[4];
+    int a0 = int(min(m0, M - 1u)) * sAm, a1 = int(min(m0 + 1u, M - 1u)) * sAm;
+    int a2 = int(min(m0 + 2u, M - 1u)) * sAm, a3 = int(min(m0 + 3u, M - 1u)) * sAm;
+    vec4 b0 = vec4(0.0), b1 = vec4(0.0), b2 = vec4(0.0);
+    if (p.u[8] != 0xffffffffu) { uint bo = p.u[8] / 4u + cg * 3u; b0 = w4[bo]; b1 = w4[bo + 1u]; b2 = w4[bo + 2u]; }
+    vec4 s0 = vec4(b0.x), s1 = vec4(b0.y), s2 = vec4(b0.z), s3 = vec4(b0.w);
+    vec4 s4 = vec4(b1.x), s5 = vec4(b1.y), s6 = vec4(b1.z), s7 = vec4(b1.w);
+    vec4 s8 = vec4(b2.x), s9 = vec4(b2.y), s10 = vec4(b2.z), s11 = vec4(b2.w);
+    uint wb = p.u[7] / 4u + cg * 3u, ws = NP / 4u;
+    for (uint k = 0u; k < K; k++) {
+        int kk = int(k) * sAk;
+#if AV4
+        vec4 x = a4[(int(Ab) + kk) / 4 + int(q)];        // m contiguous, 4-aligned rows (padded pitch)
+#else
+        vec4 x = vec4(LDA(Ab, a0 + kk), LDA(Ab, a1 + kk), LDA(Ab, a2 + kk), LDA(Ab, a3 + kk));
+#endif
+        vec4 w0 = w4[wb + k * ws], w1 = w4[wb + k * ws + 1u], w2 = w4[wb + k * ws + 2u];
+        ACC(0, w0, x) ACC(1, w0, y) ACC(2, w0, z) ACC(3, w0, w)
+        ACC(4, w1, x) ACC(5, w1, y) ACC(6, w1, z) ACC(7, w1, w)
+        ACC(8, w2, x) ACC(9, w2, y) ACC(10, w2, z) ACC(11, w2, w)
+    }
+    uint ob = p.u[9], op = p.u[12];
+    int sOm = int(p.u[10]), sOn = int(p.u[11]);
+#if OV4 == 2
+    // out n-contiguous (channels-last: sOn == 1, sOm and out 4-aligned, N % 4 == 0): 3 vec4 per frame
+#define PUTM(c, mm) if (m0 + mm < M) { int o = (int(ob) + int(m0 + mm) * sOm) / 4 + int(cg) * 3; uint n = cg * 12u; \
+    if (n < N) a4[o] = epi4(vec4(s0.c, s1.c, s2.c, s3.c), op); \
+    if (n + 4u < N) a4[o + 1] = epi4(vec4(s4.c, s5.c, s6.c, s7.c), op); \
+    if (n + 8u < N) a4[o + 2] = epi4(vec4(s8.c, s9.c, s10.c, s11.c), op); }
+    PUTM(x, 0u) PUTM(y, 1u) PUTM(z, 2u) PUTM(w, 3u)
+#else
+#if OV4
+#define PUT(j, J) { uint n = cg * 12u + J; if (n < N) a4[(int(ob) + int(n) * sOn) / 4 + int(q)] = epi4(s##j, op); }
+#else
+#define PUT(j, J) { uint n = cg * 12u + J; if (n < N) { int o = int(ob) + int(n) * sOn + int(m0) * sOm; \
+    a[o] = epi(s##j.x, op); if (m0 + 1u < M) a[o + sOm] = epi(s##j.y, op); \
+    if (m0 + 2u < M) a[o + 2 * sOm] = epi(s##j.z, op); if (m0 + 3u < M) a[o + 3 * sOm] = epi(s##j.w, op); } }
+#endif
+    PUT(0, 0u) PUT(1, 1u) PUT(2, 2u) PUT(3, 3u) PUT(4, 4u) PUT(5, 5u) PUT(6, 6u) PUT(7, 7u) PUT(8, 8u) PUT(9, 9u) PUT(10, 10u) PUT(11, 11u)
+#endif
+}

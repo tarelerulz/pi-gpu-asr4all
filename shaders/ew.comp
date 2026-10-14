@@ -1,0 +1,62 @@
+#version 450
+// Elementwise over a 4-D shape. Grid x = flattened (i2, i3) (256 per group), y = i1; i0 looped.
+// Op fixed at compile time (-DOP=n). Inputs A, B, C strided (0 = broadcast), all in the arena.
+// u: 0-3 shape | 4 out, 5-8 strides | 9 A, 10-13 | 14 B, 15-18 | 19 C, 20-23 | 25 f0 | 26 f1 | 27 1/n3 (float)
+layout(local_size_x = 256) in;
+#include "common.glsl"
+#define S(k) int(p.u[k])
+void main() {
+    uint x = gl_GlobalInvocationID.x, n3 = p.u[3], i1 = gl_GlobalInvocationID.y;
+    if (x >= p.u[2] * n3) return;
+    int q = int((float(x) + 0.5) * uintBitsToFloat(p.u[27]));      // x / n3 without integer division
+    int r = int(x) - q * int(n3);
+    if (r < 0) { q -= 1; r += int(n3); } else if (r >= int(n3)) { q += 1; r -= int(n3); }
+    uint i2 = uint(q), i3 = uint(r);
+    float f0 = uintBitsToFloat(p.u[25]), f1 = uintBitsToFloat(p.u[26]);
+    int o = S(4) + int(i1) * S(6) + int(i2) * S(7) + int(i3) * S(8);
+    int xa = S(9) + int(i1) * S(11) + int(i2) * S(12) + int(i3) * S(13);
+    int xb = S(14) + int(i1) * S(16) + int(i2) * S(17) + int(i3) * S(18);
+    int xc = S(19) + int(i1) * S(21) + int(i2) * S(22) + int(i3) * S(23);
+    for (uint i0 = 0u; i0 < p.u[0]; i0++) {
+        float x = a[xa], y = a[xb], z = a[xc], v;
+#if OP == 0
+        v = x;
+#elif OP == 1
+        v = x + y;
+#elif OP == 2
+        v = x - y;
+#elif OP == 3
+        v = x * y;
+#elif OP == 4
+        v = x / y;
+#elif OP == 5
+        v = max(x, y);
+#elif OP == 6
+        v = x * x;
+#elif OP == 7
+        v = sigm(x);
+#elif OP == 8
+        v = clamp(f0 * x + f1, 0.0, 1.0);
+#elif OP == 9
+        v = max(x, 0.0);
+#elif OP == 10
+        v = clamp(x, f0, f1);
+#elif OP == 11
+        v = log(x);
+#elif OP == 12
+        v = x * y + z;
+#elif OP == 13
+        v = x * clamp(f0 * x + f1, 0.0, 1.0);
+#elif OP == 14
+        v = x * sigm(x);
+#elif OP == 15
+        v = f0;
+#elif OP == 16
+        v = x * f0;
+#elif OP == 17
+        v = x + y * z;
+#endif
+        a[o] = v;
+        o += S(5); xa += S(10); xb += S(15); xc += S(20);
+    }
+}

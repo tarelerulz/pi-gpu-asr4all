@@ -1,0 +1,19 @@
+#version 450
+// Max over a whole 4-D strided tensor -> one float. One workgroup of 256.
+// u: 0-3 shape | 4 X, 5-8 strides | 9 out
+layout(local_size_x = 256) in;
+#include "common.glsl"
+#define LDA(base, idx) a[int(base) + (idx)]
+shared float red[256];
+void main() {
+    uint n1 = p.u[1], n2 = p.u[2], n3 = p.u[3], tot = p.u[0] * n1 * n2 * n3, l = gl_LocalInvocationID.x;
+    float m = -3.4e38;
+    for (uint i = l; i < tot; i += 256u) {
+        uint i3 = i % n3, r = i / n3, i2 = r % n2; r /= n2; uint i1 = r % n1, i0 = r / n1;
+        m = max(m, LDA(p.u[4], int(i0) * int(p.u[5]) + int(i1) * int(p.u[6]) + int(i2) * int(p.u[7]) + int(i3) * int(p.u[8])));
+    }
+    red[l] = m;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) { if (l < s) red[l] = max(red[l], red[l + s]); barrier(); }
+    if (l == 0u) a[p.u[9]] = red[0];
+}

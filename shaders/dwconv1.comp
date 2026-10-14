@@ -1,0 +1,50 @@
+#version 450
+// dwconv.comp for stride 1, dilation 1: 4 consecutive outputs per thread with a sliding window over the input
+// rows, so each tap loads one input vec4 and one weight vec4 (dwconv.comp loads 4 inputs per tap).
+// Taps unrolled by 4 so the window rotates by renaming (no register moves, no arrays: V3D spills arrays).
+// Same push constants as dwconv.comp.
+// 256-thread groups: 2026-10-13 sweep, 64 -> 256 took a step 568 -> 524 ms (A4A_LS in a4a_gpu.py must match)
+layout(local_size_x = 256) in;
+#include "common.glsl"
+int Tin, xb, xr;
+vec4 X(int t) { return (t >= 0 && t < Tin) ? a4[xb + t * xr] : vec4(0.0); }
+#define TAP(j, xa, xb_, xc, xd) { vec4 wv = w4[wb + uint(j) * C4]; s0 += wv * xa; s1 += wv * xb_; s2 += wv * xc; s3 += wv * xd; }
+void main() {
+    uint C4 = p.u[0] / 4u, T = p.u[1], q4 = (T + 3u) / 4u, i = tid();
+    if (i >= C4 * q4) return;
+    uint c4 = i % C4, t0 = (i / C4) * 4u;
+    Tin = int(p.u[6]); xr = int(p.u[8]) / 4; xb = int(p.u[7]) / 4 + int(c4);
+    uint wb = p.u[9] / 4u + c4;
+    int K = int(p.u[2]);
+    vec4 b = w4[p.u[10] / 4u + c4];
+    vec4 s0 = b, s1 = b, s2 = b, s3 = b;
+    int tt = int(t0) - int(p.u[5]);
+    vec4 x0 = X(tt), x1 = X(tt + 1), x2 = X(tt + 2), x3;
+    int j = 0;
+    for (; j + 4 <= K; j += 4) {
+        x3 = X(tt + j + 3); TAP(j, x0, x1, x2, x3)
+        x0 = X(tt + j + 4); TAP(j + 1, x1, x2, x3, x0)
+        x1 = X(tt + j + 5); TAP(j + 2, x2, x3, x0, x1)
+        x2 = X(tt + j + 6); TAP(j + 3, x3, x0, x1, x2)
+    }
+    for (; j < K; j++) {                                  // remainder: window is x0 x1 x2 again here
+        x3 = X(tt + j + 3); TAP(j, x0, x1, x2, x3)
+        x0 = x1; x1 = x2; x2 = x3;
+    }
+    uint op = p.u[14];
+    s0 = epi4(s0, op); s1 = epi4(s1, op); s2 = epi4(s2, op); s3 = epi4(s3, op);
+    int ob = int(p.u[11]), sOc = int(p.u[12]), sOt = int(p.u[13]);
+    if (p.u[15] == 1u) {                                 // channels-last output: vec4 stores
+        int o = ob / 4 + int(c4) + int(t0) * (sOt / 4);
+        a4[o] = s0;
+        if (t0 + 1u < T) a4[o + sOt / 4] = s1;
+        if (t0 + 2u < T) a4[o + 2 * (sOt / 4)] = s2;
+        if (t0 + 3u < T) a4[o + 3 * (sOt / 4)] = s3;
+    } else {
+        int o = ob + int(c4 * 4u) * sOc + int(t0) * sOt;
+#define ROW(k, v) { int oo = o + k * sOc; a[oo] = v.x; if (t0 + 1u < T) a[oo + sOt] = v.y; \
+        if (t0 + 2u < T) a[oo + 2 * sOt] = v.z; if (t0 + 3u < T) a[oo + 3 * sOt] = v.w; }
+        ROW(0, vec4(s0.x, s1.x, s2.x, s3.x)) ROW(1, vec4(s0.y, s1.y, s2.y, s3.y))
+        ROW(2, vec4(s0.z, s1.z, s2.z, s3.z)) ROW(3, vec4(s0.w, s1.w, s2.w, s3.w))
+    }
+}

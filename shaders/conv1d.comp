@@ -1,0 +1,38 @@
+#version 450
+// 1-D conv, 4 consecutive outputs of one channel per thread:
+// out[c][t] = epi(bias[c] + sum_{ci,j} W[c][ci][j] * X[g*Cg+ci][t*S + j*D - pad])   (X outside [0,Tin) = 0)
+// u: 0 Cout 1 Tout 2 Cg (in ch per group) 3 Kw 4 S 5 D 6 pad 7 Tin | 8 X, 9 sXc, 10 sXt | 11 W ([Cout][Cg][Kw])
+//    12 bias (0xffffffff none) | 13 out, 14 sOc, 15 sOt | 16 Cout per group | 17 epi
+// 256-thread groups: 2026-10-13 sweep, 64 -> 256 took a step 568 -> 524 ms (A4A_LS in a4a_gpu.py must match)
+layout(local_size_x = 256) in;
+#include "common.glsl"
+void main() {
+    uint T = p.u[1], q4 = (T + 3u) / 4u, i = tid();
+    if (i >= p.u[0] * q4) return;
+    uint c = i / q4, t0 = (i % q4) * 4u, Cg = p.u[2], Kw = p.u[3], g = c / p.u[16];
+    int S = int(p.u[4]), D = int(p.u[5]), Tin = int(p.u[7]), sXc = int(p.u[9]), sXt = int(p.u[10]);
+    uint wb = p.u[11] + c * Cg * Kw;
+    vec4 s = vec4(p.u[12] != 0xffffffffu ? w[p.u[12] + c] : 0.0);
+    int Xb = int(p.u[8]);
+    for (uint ci = 0u; ci < Cg; ci++) {
+        int xc = Xb + int(g * Cg + ci) * sXc;
+        int tt = int(t0) * S - int(p.u[6]);
+        for (uint j = 0u; j < Kw; j++) {
+            float wv = w[wb + ci * Kw + j];
+            vec4 x;
+            x.x = (tt >= 0 && tt < Tin) ? a[xc + tt * sXt] : 0.0;
+            x.y = (tt + S >= 0 && tt + S < Tin) ? a[xc + (tt + S) * sXt] : 0.0;
+            x.z = (tt + 2 * S >= 0 && tt + 2 * S < Tin) ? a[xc + (tt + 2 * S) * sXt] : 0.0;
+            x.w = (tt + 3 * S >= 0 && tt + 3 * S < Tin) ? a[xc + (tt + 3 * S) * sXt] : 0.0;
+            s += wv * x;
+            tt += D;
+        }
+        wb += 0u;
+    }
+    s = epi4(s, p.u[17]);
+    int o = int(p.u[13]) + int(c) * int(p.u[14]) + int(t0) * int(p.u[15]), sOt = int(p.u[15]);
+    a[o] = s.x;
+    if (t0 + 1u < T) a[o + sOt] = s.y;
+    if (t0 + 2u < T) a[o + 2 * sOt] = s.z;
+    if (t0 + 3u < T) a[o + 3 * sOt] = s.w;
+}

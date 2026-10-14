@@ -1,0 +1,16 @@
+#version 450
+// Copy with vec4 along the (contiguous, 4-aligned) last dim. Grid x = flattened (i2, i3/4), y = i1.
+// u: 0-3 shape (n3 % 4 == 0) | 4 out, 5-8 strides | 9 A, 10-13 strides | 27 1/(n3/4) (float)
+layout(local_size_x = 256) in;
+#include "common.glsl"
+#define S(k) int(p.u[k])
+void main() {
+    uint x = gl_GlobalInvocationID.x, n3 = p.u[3] / 4u, i1 = gl_GlobalInvocationID.y;
+    if (x >= p.u[2] * n3) return;
+    int q = int((float(x) + 0.5) * uintBitsToFloat(p.u[27]));
+    int r = int(x) - q * int(n3);
+    if (r < 0) { q -= 1; r += int(n3); } else if (r >= int(n3)) { q += 1; r -= int(n3); }
+    int o = (S(4) + int(i1) * S(6) + q * S(7)) / 4 + r;
+    int ia = (S(9) + int(i1) * S(11) + q * S(12)) / 4 + r;
+    for (uint i0 = 0u; i0 < p.u[0]; i0++) { a4[o] = a4[ia]; o += S(5) / 4; ia += S(10) / 4; }
+}

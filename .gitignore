@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+libygpu.so
+asr4all-m/
+*.wav

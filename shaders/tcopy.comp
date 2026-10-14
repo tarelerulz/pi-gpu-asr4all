@@ -1,0 +1,17 @@
+#version 450
+// 2-D transposing copy through a 16x16 shared tile: out[i][j] = A[i][j] where A is contiguous along j
+// (sAj == 1) and out contiguous along i (sOi == 1). Batch dim b = grid z.
+// u: 0 B 1 I 2 J | 3 out, 4 sOb, 5 sOi, 6 sOj | 7 A, 8 sAb, 9 sAi, 10 sAj
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "common.glsl"
+#define S(k) int(p.u[k])
+shared float tile[16][17];
+void main() {
+    uint lx = gl_LocalInvocationID.x, ly = gl_LocalInvocationID.y, b = gl_WorkGroupID.z;
+    uint i0 = gl_WorkGroupID.y * 16u, j0 = gl_WorkGroupID.x * 16u, I = p.u[1], J = p.u[2];
+    uint i = i0 + ly, j = j0 + lx;                     // read: lanes along j (A contiguous)
+    if (i < I && j < J) tile[ly][lx] = a[S(7) + int(b) * S(8) + int(i) * S(9) + int(j) * S(10)];
+    barrier();
+    i = i0 + lx; j = j0 + ly;                          // write: lanes along i (out contiguous)
+    if (i < I && j < J) a[S(3) + int(b) * S(4) + int(i) * S(5) + int(j) * S(6)] = tile[lx][ly];
+}
