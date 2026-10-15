@@ -12,10 +12,10 @@ while the CPU stays available for everything else.
 | | CPU (onnxruntime) | GPU (this repo) |
 |---|---|---|
 | Text on 32 real dictation clips (218 s of speech) | — | identical to the CPU on 32/32 |
-| Time for those 218 s of speech | ~130 s | ~182 s (0.83x real time) |
+| Time for those 218 s of speech | ~130 s | ~178 s (0.82x real time) |
 | CPU time used for them | ~490 s | ~45 s |
 | CPU while you talk (live dictation, 2 threads) | ~1 core | ~0.15 core |
-| One model step (0.64 s of audio) | 359 ms (3 threads) | ~487 ms |
+| One model step (0.64 s of audio) | 359 ms (3 threads) | ~481 ms |
 
 Accuracy check: log-probabilities within ~3e-5 of onnxruntime, the same best token on every frame.
 Raising the GPU clock to 600 MHz (`v3d_freq=600` in config.txt) gave about 5–7% more speed; 550 MHz gave nothing.
@@ -122,12 +122,17 @@ One `A4AGPU` per process: `libygpu.so` keeps one Vulkan context, and a second on
 - Each depthwise conv's history buffer is a pair that swaps every step, with two recorded command buffers
   (`yg_slot`), so the history never has to be copied in front of the new frames (`A4A_RING=0` = off).
   Another ~2%. `cache()` / `load_cache()` always read and write the current buffer.
+- Attention: the two batched matrix products load vec4s (scores along the output row and column, context along
+  the shared dimension; `A4A_BMMV=0` = scalar loads), and the scores' scale + mask is done inside the softmax
+  that reads them (`A4A_SMFUSE=0` = separate job). About 7 ms (1.4%) per step. The softmax merge is
+  bit-identical; the vec4 context product sums in a different order (differences ~1e-5, same text).
 - 256 threads per workgroup throughout. On this GPU that was worth more than any shader rewrite.
 - No fp16 or int8 on this GPU, so everything is f32.
 
 Most of each step (~75%) is the matrix work, already close to what this GPU can do. Things tried that did
 not help: other tile shapes, uniform weight reads (5–8x slower), elementwise vec4 stores (<1%), fewer
-pipeline barriers, folding the attention's Add+Mul into the matrix job.
+pipeline barriers, folding the attention's Add+Mul into the matrix job, splitting the narrow matrix jobs
+across more threads (split-K) or giving them smaller tiles.
 
 ## License
 

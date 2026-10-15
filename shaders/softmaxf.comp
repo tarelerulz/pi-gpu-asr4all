@@ -1,0 +1,27 @@
+#version 450
+// Softmax of x = A + B * C along one axis (attention scores + mask), one row per thread (2026-10-15).
+// x is written once into out, then normalized in place: saves the separate addmul job's write + read.
+// u: 0-2 shape | 3 L | 4 out, 5-7 strides, 8 axis stride | 9 A, 10-12, 13 | 14 B, 15-17, 18 | 19 C, 20-22, 23
+layout(local_size_x = 256) in;
+#include "common.glsl"
+#define S(k) int(p.u[k])
+void main() {
+    uint n1 = p.u[1], n2 = p.u[2], i = tid();
+    if (i >= p.u[0] * n1 * n2) return;
+    uint i2 = i % n2, r = i / n2, i1 = r % n1, i0 = r / n1, L = p.u[3];
+    int ob = S(4) + int(i0) * S(5) + int(i1) * S(6) + int(i2) * S(7), os = S(8);
+    int xa = S(9) + int(i0) * S(10) + int(i1) * S(11) + int(i2) * S(12), sa = S(13);
+    int xb = S(14) + int(i0) * S(15) + int(i1) * S(16) + int(i2) * S(17), sb = S(18);
+    int xc = S(19) + int(i0) * S(20) + int(i1) * S(21) + int(i2) * S(22), sc = S(23);
+    float m = -3.4e38;
+    for (uint j = 0u; j < L; j++) {
+        float x = a[xa + int(j) * sa], y = a[xb + int(j) * sb], z = a[xc + int(j) * sc], v;
+        v = x + y * z;                                     // exactly ew.comp OP 17
+        a[ob + int(j) * os] = v;
+        m = max(m, v);
+    }
+    float s = 0.0;
+    for (uint j = 0u; j < L; j++) s += exp(a[ob + int(j) * os] - m);
+    float inv = 1.0 / s;
+    for (uint j = 0u; j < L; j++) a[ob + int(j) * os] = exp(a[ob + int(j) * os] - m) * inv;
+}

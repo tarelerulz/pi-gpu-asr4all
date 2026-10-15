@@ -27,7 +27,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ONNX_DIR = os.environ.get("A4A_MODEL_DIR", os.path.join(HERE, "asr4all-m", "onnx"))   # FUTO's onnx/ folder
 VK = os.environ.get("A4A_VULKAN_DIR", "")   # optional private Vulkan loader + icd/; empty = the system's
 SHADERS = ["gemm12_00", "gemm12_01", "gemm12_02", "gemm12_10", "gemm12_11", "gemm12_12", "dwconv", "dwconv1", "shiftsum", "copy4", "tcopy", "bmm", "conv1d", "softmax", "rmax"] + ["ew%d" % i for i in range(18)] + \
-    ["gemm12p_00", "gemm12p_01", "gemm12p_02", "gemm12p_10", "gemm12p_11", "gemm12p_12", "dwconvp", "dwconv1p"]
+    ["gemm12p_00", "gemm12p_01", "gemm12p_02", "gemm12p_10", "gemm12p_11", "gemm12p_12", "dwconvp", "dwconv1p"] + \
+    ["bmm_vec1", "bmm_vec2", "softmaxf"]
 PIPE = {n: i for i, n in enumerate(SHADERS)}
 ALIGN = 16
 WBIT = 0x80000000
@@ -1261,7 +1262,16 @@ class Compiler:
             return dims[-1][1]
         u = [nb, M, N, K, A, bstride(A), A.strides[-2], A.strides[-1], B, bstride(B), B.strides[-2], B.strides[-1],
              out, bstride(out), out.strides[-2], out.strides[-1], f2u(alpha)]
-        self._emit("bmm", u, nb * ((M + 3) // 4) * ((N + 3) // 4), [a, b], [out], "bmm " + name)
+        # vec4 loads (Codex 2026-10-15): vec1 when m and n are contiguous (attention scores), vec2 when k is
+        # (attention context; different summation order, ~1e-5). A4A_BMMV=0: scalar loads only.
+        pipe = "bmm"
+        if os.environ.get("A4A_BMMV", "1") != "0":
+            ints = lambda *xs: all(int(x) % 4 == 0 for x in xs)
+            if u[6] == 1 and u[11] == 1 and ints(A.off, u[5], u[7], B.off, u[9], u[10]):
+                pipe = "bmm_vec1"
+            elif u[7] == 1 and u[10] == 1 and ints(A.off, u[5], u[6], B.off, u[9], u[11]):
+                pipe = "bmm_vec2"
+        self._emit(pipe, u, nb * ((M + 3) // 4) * ((N + 3) // 4), [a, b], [out], "bmm " + name)
         return out
 
     def _op_Einsum(self, n, ins, att):
@@ -1339,7 +1349,33 @@ class Compiler:
         pad = 3 - len(sh)
         sh, xs, os_ = [1] * pad + sh, [0] * pad + xs, [0] * pad + os_
         u = sh + [x.shape[ax], x] + xs + [x.strides[ax], out] + os_ + [out.strides[ax], mode]
+        if mode == 0 and self._softmax_fused(ins[0], x, out, ax, oth, sh, os_):
+            return
         self._emit("softmax", u, int(np.prod(sh)), [x], [out], n.op_type + " " + n.output[0])   # 256 threads (2026-10-13 sweep)
+
+    def _softmax_fused(self, name, x, out, ax, oth, sh, os_):
+        """Softmax of an addmul (x = A + B * C, attention scores + mask) read by nothing else: one job reads
+        A, B, C, writes x into the output and normalizes it there (2026-10-15). A4A_SMFUSE=0: two jobs."""
+        if os.environ.get("A4A_SMFUSE", "1") == "0" or not self.jobs:
+            return False
+        jb = self.jobs[-1]
+        if jb["pipe"] != "ew17" or jb.get("ew_args", (None,))[0] != "addmul" or name in self.outputs or \
+                len(self.consumers.get(name, [])) != 1:
+            return False
+        O = jb["ew_args"][1]
+        lead = len(O.shape) - len(x.shape)                # x may be O without leading size-1 dims (a reshape)
+        if O.root is not x.root or O.off != x.off or lead < 0 or any(d != 1 for d in O.shape[:lead]) or \
+                list(O.shape[lead:]) != list(x.shape) or list(O.strides[lead:]) != list(x.strides):
+            return False
+        srcs = [bcast(v, O.shape) for v in jb["ew_args"][2:5]]
+        srcs = [View(v.root, v.off, v.shape[lead:], v.strides[lead:]) for v in srcs]
+        u = list(sh) + [x.shape[ax], out] + os_ + [out.strides[ax]]
+        for v in srcs:                                    # same squeeze / pad to 3 dims as x in _softmax
+            st = [v.strides[i] for i in oth][-3:]
+            u += [v] + [0] * (3 - len(st)) + st + [v.strides[ax]]
+        self.jobs.pop()
+        self._emit("softmaxf", u, int(np.prod(sh)), srcs, [out], "Softmax+addmul " + name)
+        return True
 
     def _op_Softmax(self, n, ins, att): self._softmax(n, ins, att, 0)
     def _op_LogSoftmax(self, n, ins, att): self._softmax(n, ins, att, 1)
