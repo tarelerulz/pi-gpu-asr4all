@@ -491,7 +491,8 @@ class Compiler:
         assert v.size() % n == 0, ("filter_cache slot not whole", v.off, shape)
         slots = self.tlayout.setdefault("filter_cache", {})
         for k in range(v.size() // n):
-            assert slots.setdefault(v.off + k * n, (C, T)) == (C, T), "filter_cache slot read with two shapes"
+            if slots.setdefault(v.off + k * n, (C, T)) != (C, T):
+                raise RuntimeError("filter_cache slot read with two shapes")
         r.strides[-2:] = [1, C]
         return r
 
@@ -1219,16 +1220,22 @@ class A4AGPU:
         self.lib.yg_arena.restype = ctypes.c_void_p
         names = (ctypes.c_char_p * len(SHADERS))(*[s.encode() for s in SHADERS])
         w = self.p["weights"]
-        assert self.lib.yg_init(os.path.join(HERE, "shaders").encode(), names, len(SHADERS),
-                                ctypes.c_long(self.p["arena_floats"]), w.ctypes.data_as(ctypes.c_void_p),
-                                ctypes.c_long(w.size)) == 0, "yg_init failed"
+        # real work is never inside an assert: python -O would skip it (Codex audit 2026-10-14)
+        ret = self.lib.yg_init(os.path.join(HERE, "shaders").encode(), names, len(SHADERS),
+                               ctypes.c_long(self.p["arena_floats"]), w.ctypes.data_as(ctypes.c_void_p),
+                               ctypes.c_long(w.size))
+        if ret == -100:
+            raise RuntimeError("libygpu.so already in use: only one A4AGPU per process")
+        if ret != 0:
+            raise RuntimeError(f"yg_init failed ({ret})")
         self.arena = np.ctypeslib.as_array(ctypes.cast(self.lib.yg_arena(), ctypes.POINTER(ctypes.c_float)),
                                            shape=(self.p["arena_floats"],))
         for a, arr in self.p["init"]:                    # small constants live in the arena
             self.arena[a:a + arr.size] = arr
         pipe, push, groups = self.p["pipe"], self.p["push"], self.p["groups"]
-        assert self.lib.yg_plan(len(pipe), pipe.ctypes.data_as(ctypes.c_void_p), push.ctypes.data_as(ctypes.c_void_p),
-                                groups.ctypes.data_as(ctypes.c_void_p)) == 0
+        if self.lib.yg_plan(len(pipe), pipe.ctypes.data_as(ctypes.c_void_p), push.ctypes.data_as(ctypes.c_void_p),
+                            groups.ctypes.data_as(ctypes.c_void_p)) != 0:
+            raise RuntimeError("yg_plan failed")
         self.gpu_ms = 0.0
 
     def region(self, name):
@@ -1275,7 +1282,8 @@ class A4AGPU:
         self.region(self.c.pcm_name)[:] = np.asarray(pcm, np.float32).ravel()
         self._host()
         t = ctypes.c_double()
-        assert self.lib.yg_run(ctypes.byref(t)) == 0
+        if self.lib.yg_run(ctypes.byref(t)) != 0:
+            raise RuntimeError("yg_run failed")
         self.gpu_ms = t.value
         return {k: self.read(v) for k, v in self.c.out_views.items()}
 

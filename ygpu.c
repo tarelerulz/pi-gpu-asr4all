@@ -68,6 +68,7 @@ static int pipe_new(const char *dir, const char *name, VkPipeline *out) {
 }
 
 int yg_init(const char *shader_dir, const char **names, int n_names, long arena_floats, const float *weights, long n_weights) {
+    if (dev) return -100;                        /* one context per process: all state below is global */
     if (n_names > MAXP) return -1;
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "ygpu", .apiVersion = VK_API_VERSION_1_1 };
     VkInstanceCreateInfo ic = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };

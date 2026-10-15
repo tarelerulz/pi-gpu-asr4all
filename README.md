@@ -83,9 +83,27 @@ text = engine.decode_offline(pcm)     # or engine.decode_stream(chunk) ... finis
 Only the streaming acoustic model moves to the GPU. Punctuation and capitals (FUTO's PCEC model) and the
 decoder stay on the CPU. They are small.
 
-Tip for live dictation: let the GPU follow the speech, but run the last `finish()` on the CPU (swap
-`engine.model.run_stream` back to the original for that call). Text appears 0.15–0.45 s sooner after
-you stop talking, at the cost of a short CPU burst at each pause.
+Tip for live dictation: let the GPU follow the speech, but run the last `finish()` on the CPU. Text
+appears 0.15–0.45 s sooner after you stop talking, at the cost of a short CPU burst at each pause.
+While the GPU runs, the engine's caches live on the GPU, so read them back before the CPU takes over:
+
+```python
+cpu_run = engine.model.run_stream             # before use_gpu
+g = a4a_gpu.use_gpu(engine)
+gpu_run = engine.model.run_stream
+...
+for k in ("filter_cache", "attn_cache"):      # GPU caches -> numpy arrays for the CPU model
+    if not isinstance(getattr(engine, k), np.ndarray):
+        setattr(engine, k, g.cache(k))
+engine.model.run_stream = cpu_run
+try:
+    engine.finish()
+    text = engine.decode_pcec(decode_tail=True)
+finally:
+    engine.model.run_stream = gpu_run         # next step loads the numpy caches back onto the GPU
+```
+
+One `A4AGPU` per process: `libygpu.so` keeps one Vulkan context, and a second one is refused.
 
 ## How it works
 
