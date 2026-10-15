@@ -1,0 +1,23 @@
+#version 450
+// Many independent 2-D copies in one job (the end-of-step cache writes, 2026-10-15). Workgroup y = copy index;
+// the x groups stride over that copy's elements. Table row (16 uints, in the weights buffer at u[0]):
+// 0 vec4 | 1 n2 rows | 2 n3 per row (vec4s if vec4) | 3 out, 4 row stride, 5 elem stride | 6 src, 7 row, 8 elem
+// | 9 1/n3 (float). vec4 rows are contiguous and 4-aligned (as copy4.comp).
+layout(local_size_x = 256) in;
+#include "common.glsl"
+uint T(uint i) { return floatBitsToUint(w[i]); }
+void main() {
+    uint t = p.u[0] + gl_WorkGroupID.y * 16u;
+    uint v4 = T(t), n2 = T(t + 1u), n3 = T(t + 2u), total = n2 * n3;
+    int o = int(T(t + 3u)), os2 = int(T(t + 4u)), os3 = int(T(t + 5u));
+    int s = int(T(t + 6u)), ss2 = int(T(t + 7u)), ss3 = int(T(t + 8u));
+    float inv = uintBitsToFloat(T(t + 9u));
+    uint step = gl_NumWorkGroups.x * 256u;
+    for (uint x = gl_GlobalInvocationID.x; x < total; x += step) {
+        int q = int((float(x) + 0.5) * inv);              // x / n3 without integer division (as ew.comp)
+        int r = int(x) - q * int(n3);
+        if (r < 0) { q -= 1; r += int(n3); } else if (r >= int(n3)) { q += 1; r -= int(n3); }
+        if (v4 == 1u) a4[(o + q * os2) / 4 + r] = a4[(s + q * ss2) / 4 + r];
+        else a[o + q * os2 + r * os3] = a[s + q * ss2 + r * ss3];
+    }
+}

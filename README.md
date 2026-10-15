@@ -15,7 +15,7 @@ while the CPU stays available for everything else.
 | Time for those 218 s of speech | ~130 s | ~178 s (0.82x real time) |
 | CPU time used for them | ~490 s | ~45 s |
 | CPU while you talk (live dictation, 2 threads) | ~1 core | ~0.15 core |
-| One model step (0.64 s of audio) | 359 ms (3 threads) | ~481 ms |
+| One model step (0.64 s of audio) | 359 ms (3 threads) | ~473 ms |
 
 Accuracy check: log-probabilities within ~3e-5 of onnxruntime, the same best token on every frame.
 Raising the GPU clock to 600 MHz (`v3d_freq=600` in config.txt) gave about 5–7% more speed; 550 MHz gave nothing.
@@ -126,6 +126,9 @@ One `A4AGPU` per process: `libygpu.so` keeps one Vulkan context, and a second on
   the shared dimension; `A4A_BMMV=0` = scalar loads), and the scores' scale + mask is done inside the softmax
   that reads them (`A4A_SMFUSE=0` = separate job). About 7 ms (1.4%) per step. The softmax merge is
   bit-identical; the vec4 context product sums in a different order (differences ~1e-5, same text).
+- The ~63 cache writes at the end of every step (each history and the attention cache) run as one job that works
+  through a table of copies, instead of 63 small jobs that each cost ~0.08 ms just to start. 412 -> 350 jobs,
+  about 1.5% faster, bit-identical (`A4A_COPYN=0` = separate jobs).
 - 256 threads per workgroup throughout. On this GPU that was worth more than any shader rewrite.
 - No fp16 or int8 on this GPU, so everything is f32.
 

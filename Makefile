@@ -3,7 +3,7 @@ VK ?=
 VKLINK = $(if $(wildcard $(VK)/libvulkan.so*),-L$(VK) -lvulkan -Wl$(comma)-rpath$(comma)$(VK),-lvulkan)
 comma := ,
 EWOPS = 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17
-SHADERS = gemm12p_00 gemm12p_01 gemm12p_02 gemm12p_10 gemm12p_11 gemm12p_12 dwconvp dwconv1p gemm12_00 gemm12_01 gemm12_02 gemm12_10 gemm12_11 gemm12_12 dwconv dwconv1 shiftsum copy4 tcopy bmm conv1d softmax rmax $(EWOPS:%=ew%) bmm_vec1 bmm_vec2 softmaxf
+SHADERS = gemm12p_00 gemm12p_01 gemm12p_02 gemm12p_10 gemm12p_11 gemm12p_12 dwconvp dwconv1p gemm12_00 gemm12_01 gemm12_02 gemm12_10 gemm12_11 gemm12_12 dwconv dwconv1 shiftsum copy4 tcopy bmm conv1d softmax rmax $(EWOPS:%=ew%) bmm_vec1 bmm_vec2 softmaxf copyn
 all: libygpu.so $(SHADERS:%=shaders/%.spv)
 lib: libygpu.so
 libygpu.so: ygpu.c

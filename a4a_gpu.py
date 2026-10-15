@@ -28,7 +28,7 @@ ONNX_DIR = os.environ.get("A4A_MODEL_DIR", os.path.join(HERE, "asr4all-m", "onnx
 VK = os.environ.get("A4A_VULKAN_DIR", "")   # optional private Vulkan loader + icd/; empty = the system's
 SHADERS = ["gemm12_00", "gemm12_01", "gemm12_02", "gemm12_10", "gemm12_11", "gemm12_12", "dwconv", "dwconv1", "shiftsum", "copy4", "tcopy", "bmm", "conv1d", "softmax", "rmax"] + ["ew%d" % i for i in range(18)] + \
     ["gemm12p_00", "gemm12p_01", "gemm12p_02", "gemm12p_10", "gemm12p_11", "gemm12p_12", "dwconvp", "dwconv1p"] + \
-    ["bmm_vec1", "bmm_vec2", "softmaxf"]
+    ["bmm_vec1", "bmm_vec2", "softmaxf", "copyn"]
 PIPE = {n: i for i, n in enumerate(SHADERS)}
 ALIGN = 16
 WBIT = 0x80000000
@@ -245,6 +245,7 @@ class Compiler:
         self._build()
         self._redirect_gemms()
         self.fused = self._fuse_post() if os.environ.get("A4A_FUSE", "1") != "0" else 0
+        self.merged_copies = self._merge_cache_writes() if os.environ.get("A4A_COPYN", "1") != "0" else 0
         self._plan_memory()
         self._check_rings()
 
@@ -968,6 +969,54 @@ class Compiler:
     # that concat. The concat buffer becomes two persistent buffers A/B: this step's history already sits in
     # A rows 0..hist-1 (no copy in), the next history is written to B rows 0..hist-1, and the second recorded
     # plan is the same with A and B swapped. Rows are [T][C] like the transposed filter_cache slots.
+    # ---------- the end-of-step cache writes as one job (2026-10-15) ----------
+    # ~63 small copies (ring histories, attention cache) run back to back at the end of every step; each job costs
+    # ~0.08 ms to start on this GPU. copyn.comp does them all from a table in the weights buffer (one row per copy,
+    # built per ring parity in plan()). Only copies that no other merged copy reads from or writes to.
+    def _merge_cache_writes(self):
+        idx = [k for k, jb in enumerate(self.jobs) if jb["label"].startswith("cache write")
+               and jb["pipe"] in ("copy4", "ew0") and int(jb["u"][0]) == 1 and int(jb["u"][1]) == 1
+               and len(jb["reads"]) == 1 and len(jb["writes"]) == 1]
+        best, cur = [], []                                # the longest block of consecutive cache writes
+        for k in idx:
+            cur = cur + [k] if cur and cur[-1] == k - 1 else [k]
+            if len(cur) > len(best):
+                best = list(cur)
+        if len(best) < 2:
+            return 0
+        jobs = [self.jobs[k] for k in best]
+        wr = {id(j["writes"][0].root) for j in jobs}
+        if any(id(j["reads"][0].root) in wr for j in jobs):  # one copy reading another's output: keep separate
+            return 0
+        if len({id(j["writes"][0].root) for j in jobs}) < len(jobs):
+            ranges = {}
+            for j in jobs:
+                o = j["writes"][0]
+                lo = o.off + sum(min(0, (n - 1) * st) for n, st in zip(o.shape, o.strides))
+                hi = o.off + sum(max(0, (n - 1) * st) for n, st in zip(o.shape, o.strides))
+                for a, b in ranges.get(id(o.root), []):
+                    if lo <= b and a <= hi:
+                        return 0
+                ranges.setdefault(id(o.root), []).append((lo, hi))
+        big = max(int(j["u"][2]) * int(j["u"][3]) // (4 if j["pipe"] == "copy4" else 1) for j in jobs)
+        G = max(1, min(int(os.environ.get("A4A_COPYN_G", "2")), (big + 255) // 256))
+        merged = dict(pipe="copyn", u=[0, len(jobs)], groups=(G, len(jobs), 1), copies=jobs,
+                      reads=[j["reads"][0] for j in jobs], writes=[j["writes"][0] for j in jobs],
+                      label="cache writes x%d" % len(jobs))
+        self.jobs = self.jobs[:best[0]] + [merged] + self.jobs[best[-1] + 1:]
+        return len(jobs)
+
+    def _copyn_table(self, jb, swap):
+        rows = []
+        for j in jb["copies"]:
+            u = j["u"]
+            v4 = 1 if j["pipe"] == "copy4" else 0
+            n2, n3 = int(u[2]), int(u[3]) // (4 if v4 else 1)
+            o, s = self.addr(u[4], swap), self.addr(u[9], swap)
+            rows.append([v4, n2, n3, o, int(u[7]) & 0xFFFFFFFF, int(u[8]) & 0xFFFFFFFF, s, int(u[12]) & 0xFFFFFFFF,
+                         int(u[13]) & 0xFFFFFFFF, int(np.float32(1.0 / n3).view(np.uint32)), 0, 0, 0, 0, 0, 0])
+        return np.array(rows, np.uint32).ravel()
+
     def _check_rings(self):
         fc = self.in_views.get("filter_cache")
         for r in self.rings:
@@ -1457,6 +1506,15 @@ class Compiler:
                     vals.append(int(x) & 0xFFFFFFFF)
             push[i, :len(vals)] = np.array(vals, np.int64).astype(np.uint32)
         weights = np.concatenate(self.wparts).astype(np.float32)
+        extra = []                                        # copyn tables, both ring parities (same weights for both plans)
+        for i, j in enumerate(self.jobs):
+            if j["pipe"] == "copyn":
+                tabs = [self._copyn_table(j, sw) for sw in (False, True)]
+                at = weights.size + sum(x.size for x in extra)
+                push[i, 0] = at + (tabs[0].size if swap else 0)
+                extra += [t.view(np.float32) for t in tabs]
+        if extra:
+            weights = np.concatenate([weights] + extra)
         return dict(pipe=pipe, push=push, groups=groups, weights=weights, arena_floats=self.arena_floats,
                     labels=[j["label"] for j in self.jobs],
                     init=[(self.addr(v), np.asarray(arr, np.float32).ravel()) for v, arr in self.init_data])
