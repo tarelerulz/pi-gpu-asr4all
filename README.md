@@ -12,10 +12,10 @@ while the CPU stays available for everything else.
 | | CPU (onnxruntime) | GPU (this repo) |
 |---|---|---|
 | Text on 32 real dictation clips (218 s of speech) | — | identical to the CPU on 32/32 |
-| Time for those 218 s of speech | ~130 s | ~190 s (0.86–0.89x real time) |
-| CPU time used for them | ~500 s | ~46 s |
+| Time for those 218 s of speech | ~130 s | ~182 s (0.83x real time) |
+| CPU time used for them | ~490 s | ~45 s |
 | CPU while you talk (live dictation, 2 threads) | ~1 core | ~0.15 core |
-| One model step (0.64 s of audio) | 359 ms (3 threads) | ~510 ms |
+| One model step (0.64 s of audio) | 359 ms (3 threads) | ~487 ms |
 
 Accuracy check: log-probabilities within ~3e-5 of onnxruntime, the same best token on every frame.
 Raising the GPU clock to 600 MHz (`v3d_freq=600` in config.txt) gave about 5–7% more speed; 550 MHz gave nothing.
@@ -107,8 +107,8 @@ One `A4AGPU` per process: `libygpu.so` keeps one Vulkan context, and a second on
 
 ## How it works
 
-`a4a_gpu.py` reads the ONNX graph once and turns it into a list of about 550 GPU jobs. `libygpu.so`
-(`ygpu.c`) records them into one Vulkan command buffer and replays it for every 0.64 s step.
+`a4a_gpu.py` reads the ONNX graph once and turns it into a list of about 420 GPU jobs. `libygpu.so`
+(`ygpu.c`) records them into a Vulkan command buffer and replays it for every 0.64 s step.
 
 - Reshape / Slice / Transpose / Split cost nothing: they become views (offset + strides) into one buffer.
 - Matrix work (Gemm, MatMul, 1x1 Conv, the spectrogram framing) uses one tuned shader: 12 outputs x 4 frames
@@ -116,11 +116,18 @@ One `A4AGPU` per process: `libygpu.so` keeps one Vulkan context, and a second on
 - Depthwise convolutions use a sliding window over the input. The attention's "15 shifted windows" chain is one job.
 - The two state caches (about 9 MB) stay on the GPU between steps, in a layout chosen so that reading and
   writing them are contiguous copies.
+- An Add or Div right after a matrix job or depthwise conv is done by that job as it stores its result, and a
+  BatchNorm of a matrix result is written as a second output (`A4A_FUSE=0` turns this off). Same float
+  operations in the same order, so the output is bit-identical; 551 -> 466 jobs, about 4% faster.
+- Each depthwise conv's history buffer is a pair that swaps every step, with two recorded command buffers
+  (`yg_slot`), so the history never has to be copied in front of the new frames (`A4A_RING=0` = off).
+  Another ~2%. `cache()` / `load_cache()` always read and write the current buffer.
 - 256 threads per workgroup throughout. On this GPU that was worth more than any shader rewrite.
 - No fp16 or int8 on this GPU, so everything is f32.
 
 Most of each step (~75%) is the matrix work, already close to what this GPU can do. Things tried that did
-not help: other tile shapes, uniform weight reads (5–8x slower), elementwise vec4 stores (<1%).
+not help: other tile shapes, uniform weight reads (5–8x slower), elementwise vec4 stores (<1%), fewer
+pipeline barriers, folding the attention's Add+Mul into the matrix job.
 
 ## License
 

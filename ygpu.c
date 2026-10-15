@@ -24,7 +24,8 @@
 typedef struct { VkBuffer buf; VkDeviceMemory mem; void *map; size_t size; } Buf;
 
 static VkInstance inst; static VkPhysicalDevice phys; static VkDevice dev; static VkQueue queue;
-static VkCommandPool pool; static VkCommandBuffer cb; static VkPhysicalDeviceMemoryProperties memprops;
+static VkCommandPool pool; static VkCommandBuffer cb, cbs[2]; static VkPhysicalDeviceMemoryProperties memprops;
+static int qcount;
 static VkDescriptorSetLayout dsl; static VkPipelineLayout layout; static VkDescriptorPool dpool; static VkDescriptorSet set;
 static VkPipeline pipes[MAXP]; static int npipes;
 static VkQueryPool qpool; static int njobs; static float ts_period = 1.0f;
@@ -85,8 +86,9 @@ int yg_init(const char *shader_dir, const char **names, int n_names, long arena_
     vkGetDeviceQueue(dev, qfam, 0, &queue);
     VkCommandPoolCreateInfo pc = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = qfam, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT };
     CK(vkCreateCommandPool(dev, &pc, NULL, &pool));
-    VkCommandBufferAllocateInfo ca = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
-    CK(vkAllocateCommandBuffers(dev, &ca, &cb));
+    VkCommandBufferAllocateInfo ca = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 2 };
+    CK(vkAllocateCommandBuffers(dev, &ca, cbs));
+    cb = cbs[0];
     vkGetPhysicalDeviceMemoryProperties(phys, &memprops);
 
     VkDescriptorSetLayoutBinding lb[2];
@@ -122,9 +124,12 @@ void *yg_arena(void) { return arena.map; }
 
 int yg_plan(int n, const int *pipe, const uint32_t *push, const uint32_t *groups) {
     int no_ts = getenv("YG_NO_TS") != NULL;   /* per-job timestamps off (they serialize the queue) */
-    if (qpool) { vkDestroyQueryPool(dev, qpool, NULL); qpool = VK_NULL_HANDLE; }
-    VkQueryPoolCreateInfo qi = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = n + 1 };
-    CK(vkCreateQueryPool(dev, &qi, NULL, &qpool));
+    if (n + 1 > qcount) {                     /* both slots' command buffers share the pool: only ever grow it */
+        if (qpool) { vkQueueWaitIdle(queue); vkDestroyQueryPool(dev, qpool, NULL); qpool = VK_NULL_HANDLE; }
+        VkQueryPoolCreateInfo qi = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = n + 1 };
+        CK(vkCreateQueryPool(dev, &qi, NULL, &qpool));
+        qcount = n + 1;
+    }
     njobs = n;
     CK(vkResetCommandBuffer(cb, 0));
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -145,6 +150,14 @@ int yg_plan(int n, const int *pipe, const uint32_t *push, const uint32_t *groups
     VkMemoryBarrier hb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT };
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, NULL, 0, NULL);
     CK(vkEndCommandBuffer(cb));
+    return 0;
+}
+
+/* Two recorded plans (double-buffered conv histories, 2026-10-14): yg_slot picks the command buffer that the next
+   yg_plan records and yg_run submits. Slot 0 is the default, so single-plan callers are unchanged. */
+int yg_slot(int s) {
+    if (s < 0 || s > 1) return -1;
+    cb = cbs[s];
     return 0;
 }
 

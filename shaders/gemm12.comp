@@ -3,6 +3,9 @@
 // W = weights [K][NP] (NP multiple of 12, vec4-aligned), out strided.
 // OV4: 0 scalar stores, 1 vec4 along m, 2 vec4 along n.
 // u: 0 M 1 N 2 K 3 NP | 4 A, 5 sAm, 6 sAk | 7 W | 8 bias (0xffffffff = none) | 9 out, 10 sOm, 11 sOn | 12 epi
+// -DPOST (gemm12p_*): 13 R = residual with the out strides, added after epi (folds an Add job in, 2026-10-14)
+//   OV4 1 only: 14 mode (0 none, 1 v + R) | 16 out2 (0xffffffff = none,
+//   out strides) = v * S[n] + T[n] (a BatchNorm of the result, also kept) | 17 S, 18 T, 19 sSn, 20 sTn
 layout(local_size_x = 256) in;
 #include "common.glsl"
 #define LDA(base, idx) a[int(base) + (idx)]
@@ -35,20 +38,40 @@ void main() {
     }
     uint ob = p.u[9], op = p.u[12];
     int sOm = int(p.u[10]), sOn = int(p.u[11]);
+#ifdef POST
+    int dR = int(p.u[13]) - int(ob);
+#define R4(o) + a4[(o) + dR / 4]
+#define R1(o) + a[(o) + dR]
+#else
+#define R4(o)
+#define R1(o)
+#endif
 #if OV4 == 2
     // out n-contiguous (channels-last: sOn == 1, sOm and out 4-aligned, N % 4 == 0): 3 vec4 per frame
 #define PUTM(c, mm) if (m0 + mm < M) { int o = (int(ob) + int(m0 + mm) * sOm) / 4 + int(cg) * 3; uint n = cg * 12u; \
-    if (n < N) a4[o] = epi4(vec4(s0.c, s1.c, s2.c, s3.c), op); \
-    if (n + 4u < N) a4[o + 1] = epi4(vec4(s4.c, s5.c, s6.c, s7.c), op); \
-    if (n + 8u < N) a4[o + 2] = epi4(vec4(s8.c, s9.c, s10.c, s11.c), op); }
+    if (n < N) a4[o] = epi4(vec4(s0.c, s1.c, s2.c, s3.c), op) R4(o); \
+    if (n + 4u < N) a4[o + 1] = epi4(vec4(s4.c, s5.c, s6.c, s7.c), op) R4(o + 1); \
+    if (n + 8u < N) a4[o + 2] = epi4(vec4(s8.c, s9.c, s10.c, s11.c), op) R4(o + 2); }
     PUTM(x, 0u) PUTM(y, 1u) PUTM(z, 2u) PUTM(w, 3u)
 #else
 #if OV4
+#ifdef POST
+    uint pm = p.u[14];
+    int d2 = int(p.u[16]) - int(ob);
+    bool o2 = p.u[16] != 0xffffffffu;
+#define PUT(j, J) { uint n = cg * 12u + J; if (n < N) { int o = (int(ob) + int(n) * sOn) / 4 + int(q); \
+    vec4 v = epi4(s##j, op); \
+    if (pm == 1u) v = v + a4[o + dR / 4]; \
+    a4[o] = v; \
+    if (o2) a4[o + d2 / 4] = v * a[int(p.u[17]) + int(n) * int(p.u[19])] + a[int(p.u[18]) + int(n) * int(p.u[20])]; } }
+#else
 #define PUT(j, J) { uint n = cg * 12u + J; if (n < N) a4[(int(ob) + int(n) * sOn) / 4 + int(q)] = epi4(s##j, op); }
+#endif
 #else
 #define PUT(j, J) { uint n = cg * 12u + J; if (n < N) { int o = int(ob) + int(n) * sOn + int(m0) * sOm; \
-    a[o] = epi(s##j.x, op); if (m0 + 1u < M) a[o + sOm] = epi(s##j.y, op); \
-    if (m0 + 2u < M) a[o + 2 * sOm] = epi(s##j.z, op); if (m0 + 3u < M) a[o + 3 * sOm] = epi(s##j.w, op); } }
+    a[o] = epi(s##j.x, op) R1(o); if (m0 + 1u < M) a[o + sOm] = epi(s##j.y, op) R1(o + sOm); \
+    if (m0 + 2u < M) a[o + 2 * sOm] = epi(s##j.z, op) R1(o + 2 * sOm); \
+    if (m0 + 3u < M) a[o + 3 * sOm] = epi(s##j.w, op) R1(o + 3 * sOm); } }
 #endif
     PUT(0, 0u) PUT(1, 1u) PUT(2, 2u) PUT(3, 3u) PUT(4, 4u) PUT(5, 5u) PUT(6, 6u) PUT(7, 7u) PUT(8, 8u) PUT(9, 9u) PUT(10, 10u) PUT(11, 11u)
 #endif

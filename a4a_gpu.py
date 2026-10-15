@@ -16,6 +16,7 @@ Use:  python a4a_gpu.py --steps 6 [--profile] [--wav clip.wav]   compare with on
 """
 import ctypes
 import os
+import re
 import struct
 import sys
 import time
@@ -25,7 +26,8 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 ONNX_DIR = os.environ.get("A4A_MODEL_DIR", os.path.join(HERE, "asr4all-m", "onnx"))   # FUTO's onnx/ folder
 VK = os.environ.get("A4A_VULKAN_DIR", "")   # optional private Vulkan loader + icd/; empty = the system's
-SHADERS = ["gemm12_00", "gemm12_01", "gemm12_02", "gemm12_10", "gemm12_11", "gemm12_12", "dwconv", "dwconv1", "shiftsum", "copy4", "tcopy", "bmm", "conv1d", "softmax", "rmax"] + ["ew%d" % i for i in range(18)]
+SHADERS = ["gemm12_00", "gemm12_01", "gemm12_02", "gemm12_10", "gemm12_11", "gemm12_12", "dwconv", "dwconv1", "shiftsum", "copy4", "tcopy", "bmm", "conv1d", "softmax", "rmax"] + ["ew%d" % i for i in range(18)] + \
+    ["gemm12p_00", "gemm12p_01", "gemm12p_02", "gemm12p_10", "gemm12p_11", "gemm12p_12", "dwconvp", "dwconv1p"]
 PIPE = {n: i for i, n in enumerate(SHADERS)}
 ALIGN = 16
 WBIT = 0x80000000
@@ -238,9 +240,12 @@ class Compiler:
         self.wparts, self.wsize, self.wcache = [], 0, {}
         self.host_nodes, self.host_vals, self.host_up = [], {}, {}
         self.init_data, self.skip, self.producer, self.chain = [], set(), {}, {}
+        self.rings, self.swap = [], {}                   # double-buffered conv histories (see _ring_ok)
         self._build()
         self._redirect_gemms()
+        self.fused = self._fuse_post() if os.environ.get("A4A_FUSE", "1") != "0" else 0
         self._plan_memory()
+        self._check_rings()
 
     # ---------- helpers ----------
     def _new(self, name, shape, kind="arena", pitch=True):
@@ -509,7 +514,7 @@ class Compiler:
     def _write_into(self, name, dest):
         p = self.prod.get(name)
         if p is None or id(p) not in self.tree_nodes or name in self.host_vals or name in self.consts or name in self.t:
-            self._copy(self._get(name), dest, "cache write " + name)
+            self._copy(self._get(name), self._ring_dest(dest), "cache write " + name)
             return
         shape_in = lambda x: list(self.shapes[x]) if x in self.shapes else None
         if p.op_type == "Concat":
@@ -606,6 +611,161 @@ class Compiler:
                 drop.add(ci)
         self.jobs = [jb for k, jb in enumerate(self.jobs) if k not in drop]
         self.redirected = len(drop)
+
+    # ---------- Add / Div folded into the gemm / depthwise conv that made one input (2026-10-14) ----------
+    # out = X + R (or X / R for convs) where X is read by nothing else: the producer writes epi(...) + R straight
+    # into the Add's output and the elementwise job is dropped. Same float operations in the same order, so the
+    # result is bit-identical (checked: log-probs, hidden and both caches over 10 real-speech steps).
+    def _fuse_post(self):
+        outs = {id(v.root) for v in self.out_views.values()}
+        n = 0
+        while True:
+            touch = {}
+            for k, jb in enumerate(self.jobs):
+                for v in jb["reads"]:
+                    touch.setdefault(id(v.root), []).append((k, "r"))
+                for v in jb["writes"]:
+                    touch.setdefault(id(v.root), []).append((k, "w"))
+            for k, jb in enumerate(self.jobs):
+                if jb["pipe"] not in ("ew1", "ew4", "ew17", "ew12") or "ew_args" not in jb:
+                    continue
+                op, O, a, b, c = jb["ew_args"][:5]
+                if op == "addmul":                        # tried 2026-10-14: no gain (B is channels-last)
+                    ok = False
+                elif op == "fma":                         # a * b + c with b, c per channel: BatchNorm
+                    ok = self._fuse_bn(k, a, b, c, O, touch, outs)
+                else:
+                    pairs = [(a, b), (b, a)] if op == "add" else [(a, b)]
+                    ok = any(self._fuse_one(k, X, R, O, op, touch, outs) for X, R in pairs)
+                if ok:
+                    del self.jobs[k]
+                    n += 1
+                    break
+            else:
+                return n
+
+    def _gemm_coords(self, g, X):
+        """axis of X that is gemm row m / column n (None if X is not exactly the gemm's output)."""
+        M, N, sm, sn = g["u"][0], g["u"][1], g["u"][10], g["u"][11]
+        if g["writes"][0].off != X.off or sm == sn:
+            return None
+        dims = {}
+        for d, (sz, st) in enumerate(zip(X.shape, X.strides)):
+            if sz == 1:
+                continue
+            key = "m" if (st, sz) == (sm, M) else "n" if (st, sz) == (sn, N) else None
+            if key is None or key in dims:
+                return None
+            dims[key] = d
+        return dims if set(dims) == {"m", "n"} else None
+
+    def _gemm_post_init(self, g):
+        if re.fullmatch(r"gemm12_\d\d", g["pipe"]):
+            g["u"] = list(g["u"][:13]) + [0, 0, 0, NONE, 0, 0, 0, 0]
+            g["pipe"] = "gemm12p_" + g["pipe"][7:]
+
+    def _fuse_bn(self, k, X, S, T, O, touch, outs):
+        """O = X * S + T (S, T per column) where X is a gemm output (OV4 1): the gemm also writes O."""
+        if X is None or S is None or T is None or O.root.kind != "arena" or list(X.shape) != list(O.shape):
+            return False
+        ws = [i for i, m in touch.get(id(X.root), []) if m == "w"]
+        if len(ws) != 1 or ws[0] >= k:
+            return False
+        j = ws[0]
+        g = self.jobs[j]
+        if not re.fullmatch(r"gemm12p?_\d1", g["pipe"]) or len(g["writes"]) != 1 or \
+                (len(g["u"]) > 16 and not (isinstance(g["u"][16], int) and g["u"][16] == NONE)):
+            return False
+        dims = self._gemm_coords(g, X)
+        if dims is None or any(j <= i < k for i, m in touch.get(id(X.root), []) if m == "w" and i != j):
+            return False
+        if any(j < i < k for i, _ in touch.get(id(O.root), [])) or O.root is X.root:
+            return False
+        Sb, Tb = bcast(S, O.shape), bcast(T, O.shape)
+        for V in (Sb, Tb):
+            if V.strides[dims["m"]] != 0 or any(i >= j for i, m in touch.get(id(V.root), []) if m == "w"):
+                return False
+        W = g["writes"][0]
+        on, q4 = W.strides[1], (g["u"][0] + 3) // 4 * 4
+        if O.strides[dims["m"]] != W.strides[0] or O.strides[dims["n"]] != on or W.strides[0] != 1 or \
+                O.off % 4 or (O.off - W.off) % 4 or O.off % on + q4 > on:
+            return False
+        self._gemm_post_init(g)
+        g["u"][16:21] = [View(O.root, O.off, list(W.shape), list(W.strides)), Sb, Tb,
+                         Sb.strides[dims["n"]], Tb.strides[dims["n"]]]
+        g["u"][17] = View(Sb.root, Sb.off, [1], [0])
+        g["u"][18] = View(Tb.root, Tb.off, [1], [0])
+        g["reads"] = list(g["reads"]) + [Sb, Tb]
+        g["writes"] = list(g["writes"]) + [g["u"][16]]
+        g["label"] += " +bn"
+        return True
+
+    def _fuse_one(self, k, X, R, O, op, touch, outs):
+        if X is None or R is None or X.root is R.root or R.root is O.root or X.root is O.root:
+            return False
+        if X.root.kind != "arena" or O.root.kind != "arena" or id(X.root) in outs or list(X.shape) != list(O.shape):
+            return False
+        tx = touch.get(id(X.root), [])
+        js = [i for i, m in tx if m == "w"]
+        if len(js) != 1 or {i for i, _ in tx} != {js[0], k}:
+            return False
+        j = js[0]
+        g = self.jobs[j]
+        kind = "gemm" if re.fullmatch(r"gemm12_\d\d", g["pipe"]) else "dw" if g["pipe"] in ("dwconv", "dwconv1") else None
+        if kind is None or (op == "div" and kind != "dw") or len(g["writes"]) != 1:
+            return False
+        if any(i >= j for i, m in touch.get(id(R.root), []) if m == "w" and i != k):
+            return False                                  # R must be final before the producer runs
+        if any(j < i < k for i, _ in touch.get(id(O.root), [])):
+            return False                                  # nothing between may see the Add output early
+        W = g["writes"][0]
+        Rb = bcast(R, O.shape)
+        if kind == "gemm":
+            M, N, sm, sn = g["u"][0], g["u"][1], g["u"][10], g["u"][11]
+        else:
+            N, M, sn, sm = g["u"][0], g["u"][1], g["u"][12], g["u"][13]   # dw: (C, T) as (n, m)
+        if W.off != X.off or sm == sn:
+            return False
+        dims = {}                                         # "m" / "n" -> axis of X
+        for d, (sz, st) in enumerate(zip(X.shape, X.strides)):
+            if sz == 1:
+                continue
+            key = "m" if (st, sz) == (sm, M) else "n" if (st, sz) == (sn, N) else None
+            if key is None or key in dims:
+                return False
+            dims[key] = d
+        if set(dims) != {"m", "n"}:
+            return False
+        oS = {key: O.strides[d] for key, d in dims.items()}
+        rS = {key: Rb.strides[d] for key, d in dims.items()}
+        if kind == "gemm":
+            if rS != oS or op != "add":
+                return False
+            om, on = oS["m"], oS["n"]
+            q4 = (M + 3) // 4 * 4
+            ops = [Rb]
+            ov = 1 if om == 1 and on % 4 == 0 and O.off % 4 == 0 and O.off % on + q4 <= on and \
+                all(V.off % 4 == 0 and V.off % on + q4 <= on for V in ops) else \
+                2 if on == 1 and om % 4 == 0 and O.off % 4 == 0 and N % 4 == 0 and all(V.off % 4 == 0 for V in ops) else 0
+            o = View(O.root, O.off, [M, N], [om, on])
+            av = g["pipe"][7]
+            self._gemm_post_init(g)
+            g["u"][9:12] = [o, om, on]
+            g["u"][13:15] = [View(Rb.root, Rb.off, [M, N], [om, on]), 1]
+            g["pipe"] = "gemm12p_" + av + str(ov)
+        else:
+            oc, ot = oS["n"], oS["m"]
+            cl = int(oc == 1 and ot % 4 == 0 and O.off % 4 == 0)
+            o = View(O.root, O.off, [1, N, M], [0, oc, ot])
+            g["u"][11:14] = [o, oc, ot]
+            g["u"][15] = cl
+            g["u"] = list(g["u"][:16]) + [0, 0, 0, View(Rb.root, Rb.off, [N, M], [rS["n"], rS["m"]]),
+                                          rS["n"], rS["m"], 1 if op == "add" else 2]
+            g["pipe"] += "p"
+        g["reads"] = list(g["reads"]) + [Rb]
+        g["writes"] = [o]
+        g["label"] += " +" + op
+        return True
 
     # ---------- sum-of-products chains (attention shift-sum) ----------
     def _find_sum_chains(self):
@@ -786,17 +946,81 @@ class Compiler:
         ax = att["axis"] % len(vs[0].shape)
         shape = list(vs[0].shape)
         shape[ax] = sum(v.shape[ax] for v in vs)
-        if len(shape) == 3 and shape[0] == 1 and ax == 2 and self._dw_consumer(n.output[0]):
+        ring = self._ring_ok(n, vs, ax, shape)
+        if ring:
+            out = self._new_ring(n.output[0], shape, vs[0])
+        elif len(shape) == 3 and shape[0] == 1 and ax == 2 and self._dw_consumer(n.output[0]):
             out = self._new_cl(n.output[0], shape)
         else:
             flat = all(c.op_type == "Reshape" for c in self.consumers.get(n.output[0], []))
             out = self._new(n.output[0], shape, pitch=not flat)
         pos = 0
-        for v in vs:
+        for k, v in enumerate(vs):
             sh = list(shape)
             sh[ax] = v.shape[ax]
-            self._copy(v, View(out.root, pos * out.strides[ax], sh, out.strides), "concat " + n.output[0])
+            if not (ring and k == 0):                    # ring: the history is already in rows 0..hist-1
+                self._copy(v, View(out.root, pos * out.strides[ax], sh, out.strides), "concat " + n.output[0])
             pos += v.shape[ax]
+
+    # ---------- double-buffered depthwise-conv histories (2026-10-14) ----------
+    # concat([filter_cache slot (hist frames), new frames]) -> depthwise conv, and the next history is a Slice of
+    # that concat. The concat buffer becomes two persistent buffers A/B: this step's history already sits in
+    # A rows 0..hist-1 (no copy in), the next history is written to B rows 0..hist-1, and the second recorded
+    # plan is the same with A and B swapped. Rows are [T][C] like the transposed filter_cache slots.
+    def _check_rings(self):
+        fc = self.in_views.get("filter_cache")
+        for r in self.rings:
+            if not r.get("written"):
+                raise RuntimeError("ring history never saved: " + r["name"])
+            for jb in self.jobs:
+                for v in jb["reads"]:
+                    if v.root is fc.root:
+                        lo = v.off + sum(min(0, (n - 1) * s) for n, s in zip(v.shape, v.strides))
+                        hi = v.off + sum(max(0, (n - 1) * s) for n, s in zip(v.shape, v.strides))
+                        if lo < r["off"] + r["n"] and r["off"] <= hi:
+                            raise RuntimeError("ring slot still read from filter_cache: " + jb["label"])
+
+    def _ring_ok(self, n, vs, ax, shape):
+        fc = self.in_views.get("filter_cache")
+        if os.environ.get("A4A_RING", "1") == "0" or fc is None or len(vs) != 2 or ax != 2 or len(shape) != 3:
+            return False
+        v, C = vs[0], shape[1]
+        if v.root is not fc.root or v.strides[1] != 1 or v.strides[2] != C or v.off % 4 or C % 4 or shape[0] != 1:
+            return False
+        if not self._dw_consumer(n.output[0]):
+            return False
+        for c in self.consumers.get(n.output[0], []):
+            if c.op_type == "Slice":
+                if not all(id(x) in self.tree_nodes for x in self.consumers.get(c.output[0], [])):
+                    return False
+            elif not (c.op_type == "Conv" and c.input[0] == n.output[0]):
+                return False
+        return True
+
+    def _new_ring(self, name, shape, hist):
+        T, C = shape[2], shape[1]
+        A = self._new(name + "#ringA", [1, T, C], "fixed")
+        B = self._new(name + "#ringB", [1, T, C], "fixed")
+        v = View(A.root, 0, list(shape), [T * C, 1, C])
+        self.t[name] = v
+        self.rings.append(dict(A=A.root, B=B.root, off=hist.off, n=C * hist.shape[2], name=name))
+        self.swap[id(A.root)], self.swap[id(B.root)] = B.root, A.root
+        return v
+
+    def _ring_dest(self, dest):
+        """A cache-out write into a ring slot of filter_cache goes to the B buffer instead."""
+        fc = self.in_views.get("filter_cache")
+        if fc is None or dest.root is not fc.root:
+            return dest
+        lo = dest.off + sum(min(0, (n - 1) * s) for n, s in zip(dest.shape, dest.strides))
+        hi = dest.off + sum(max(0, (n - 1) * s) for n, s in zip(dest.shape, dest.strides))
+        for r in self.rings:
+            if r["off"] <= lo and hi < r["off"] + r["n"]:
+                r["written"] = True
+                return View(r["B"], dest.off - r["off"], dest.shape, dest.strides)
+            if lo < r["off"] + r["n"] and r["off"] <= hi:
+                raise RuntimeError("cache write straddles a ring slot: " + r["name"])
+        return dest
 
     def _op_Pad(self, n, ins, att):
         v = self._get(ins[0])
@@ -1065,7 +1289,7 @@ class Compiler:
         Tin = x.shape[2]
         Tout = (Tin + pads[0] + pads[1] - D * (Kw - 1) - 1) // S + 1
         if G == Cout and Cg == 1 and Cout % 4 == 0 and x.strides[1] == 1 and x.strides[2] % 4 == 0 \
-                and x.off % 4 == 0 and x.root.kind == "arena":
+                and x.off % 4 == 0 and x.root.kind in ("arena", "fixed"):
             cl = self._dw_consumer(n.output[0])
             out = self._new_cl(n.output[0], [1, Cout, Tout]) if cl else self._new(n.output[0], [1, Cout, Tout])
             self.chain[n.output[0]] = n.output[0]
@@ -1168,11 +1392,13 @@ class Compiler:
             placed.append(r)
         self.arena_floats = total
 
-    def addr(self, v):
+    def addr(self, v, swap=False):
         r = v.root.alias if v.root.kind == "alias" else v.root
+        if swap:
+            r = self.swap.get(id(r), r)
         return r.offset + v.off
 
-    def plan(self):
+    def plan(self, swap=False):
         n = len(self.jobs)
         pipe = np.array([PIPE[j["pipe"]] for j in self.jobs], np.int32)
         push = np.zeros((n, 32), np.uint32)
@@ -1190,7 +1416,7 @@ class Compiler:
             vals = []
             for x in u:
                 if isinstance(x, View):
-                    vals.append(self.addr(x))
+                    vals.append(self.addr(x, swap))
                 else:
                     vals.append(int(x) & 0xFFFFFFFF)
             push[i, :len(vals)] = np.array(vals, np.int64).astype(np.uint32)
@@ -1232,10 +1458,17 @@ class A4AGPU:
                                            shape=(self.p["arena_floats"],))
         for a, arr in self.p["init"]:                    # small constants live in the arena
             self.arena[a:a + arr.size] = arr
-        pipe, push, groups = self.p["pipe"], self.p["push"], self.p["groups"]
-        if self.lib.yg_plan(len(pipe), pipe.ctypes.data_as(ctypes.c_void_p), push.ctypes.data_as(ctypes.c_void_p),
-                            groups.ctypes.data_as(ctypes.c_void_p)) != 0:
-            raise RuntimeError("yg_plan failed")
+        self.par = 0                                     # which plan runs next (rings: A/B swap every step)
+        plans = [self.p] + ([self.c.plan(swap=True)] if self.c.rings else [])
+        for s, pl in enumerate(plans):
+            pipe, push, groups = pl["pipe"], pl["push"], pl["groups"]
+            if self.c.rings and self.lib.yg_slot(s) != 0:
+                raise RuntimeError("libygpu.so has no second plan slot (rebuild it)")
+            if self.lib.yg_plan(len(pipe), pipe.ctypes.data_as(ctypes.c_void_p), push.ctypes.data_as(ctypes.c_void_p),
+                                groups.ctypes.data_as(ctypes.c_void_p)) != 0:
+                raise RuntimeError("yg_plan failed")
+        if self.c.rings:
+            self.lib.yg_slot(0)
         self.gpu_ms = 0.0
 
     def region(self, name):
@@ -1267,12 +1500,25 @@ class A4AGPU:
             a = c.addr(view)
             self.arena[a:a + view.size()] = np.asarray(vals[name], np.float32).ravel()
 
+    def _ring_rows(self, r):
+        """This step's history of ring r (A on even plans, B on odd), as a flat [T][C] arena slice."""
+        root = r["A"] if self.par == 0 else r["B"]
+        return self.arena[root.offset:root.offset + r["n"]]
+
     def load_cache(self, which, arr):
-        self.region(which)[:] = self.c.to_internal(which, arr)
+        x = self.c.to_internal(which, arr)
+        self.region(which)[:] = x
+        if which == "filter_cache":
+            for r in self.c.rings:
+                self._ring_rows(r)[:] = x[r["off"]:r["off"] + r["n"]]
 
     def cache(self, which):
-        """A cache in ONNX layout (the GPU keeps filter_cache slots transposed)."""
-        return self.c.from_internal(which, self.region(which))
+        """A cache in ONNX layout (the GPU keeps filter_cache slots transposed, ring slots in their A/B buffer)."""
+        x = np.array(self.region(which))
+        if which == "filter_cache":
+            for r in self.c.rings:
+                x[r["off"]:r["off"] + r["n"]] = self._ring_rows(r)
+        return self.c.from_internal(which, x)
 
     def step(self, pcm, filter_cache=None, attn_cache=None):
         if filter_cache is not None:
@@ -1282,8 +1528,12 @@ class A4AGPU:
         self.region(self.c.pcm_name)[:] = np.asarray(pcm, np.float32).ravel()
         self._host()
         t = ctypes.c_double()
+        if self.c.rings:
+            self.lib.yg_slot(self.par)
         if self.lib.yg_run(ctypes.byref(t)) != 0:
             raise RuntimeError("yg_run failed")
+        if self.c.rings:
+            self.par ^= 1
         self.gpu_ms = t.value
         return {k: self.read(v) for k, v in self.c.out_views.items()}
 
