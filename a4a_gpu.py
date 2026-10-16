@@ -1520,6 +1520,35 @@ class Compiler:
                     init=[(self.addr(v), np.asarray(arr, np.float32).ravel()) for v, arr in self.init_data])
 
 
+def _pipeline_shapes(plans):
+    """Deduplicate pipelines by fixed geometry, retaining dynamic buffer addresses.
+
+    Plan pipe indices remain unchanged for profiling. Returned indices are used
+    only by the C runner. Both ring parities share specializations, never offsets.
+    """
+    gemm = (0, 1, 2, 3, 5, 6, 10, 11, 12, 14, 19, 20)
+    depthwise = (0, 1, 2, 3, 4, 5, 6, 8, 12, 13, 14, 15, 20, 21, 22)
+    names, shapes, pipes, seen = [], [], [], {}
+    for plan in plans:
+        indices = []
+        for pipe, push in zip(plan["pipe"], plan["push"]):
+            name = SHADERS[pipe]
+            fields = gemm if name.startswith("gemm12") else depthwise if name.startswith("dwconv") else ()
+            shape = np.full(32, 0xffffffff, np.uint32)
+            if fields:
+                shape[list(fields)] = push[list(fields)]
+            key = (name, shape.tobytes())
+            if key not in seen:
+                seen[key] = len(names)
+                names.append(name)
+                shapes.append(shape)
+            indices.append(seen[key])
+        pipes.append(np.asarray(indices, np.int32))
+    if len(names) > 64:                  # preserve the runner's MAXP limit for other graphs
+        return SHADERS, None, [p["pipe"] for p in plans]
+    return names, np.asarray(shapes, np.uint32), pipes
+
+
 class A4AGPU:
     """One stream graph on the GPU. step(pcm, filter_cache=None, attn_cache=None) -> (log_probs, hidden).
     Caches stay on the GPU; pass numpy caches only to (re)load state (reset / restore)."""
@@ -1538,12 +1567,19 @@ class A4AGPU:
         self.build_s = time.time() - t
         self.lib = ctypes.CDLL(os.path.join(HERE, "libygpu.so"))
         self.lib.yg_arena.restype = ctypes.c_void_p
-        names = (ctypes.c_char_p * len(SHADERS))(*[s.encode() for s in SHADERS])
+        plans = [self.p] + ([self.c.plan(swap=True)] if self.c.rings else [])
+        shape_names, shapes, run_pipes = SHADERS, None, [p["pipe"] for p in plans]
+        if os.environ.get("A4A_SPECIALIZE", "1") != "0" and hasattr(self.lib, "yg_init_shapes"):
+            shape_names, shapes, run_pipes = _pipeline_shapes(plans)
+        names = (ctypes.c_char_p * len(shape_names))(*[s.encode() for s in shape_names])
+        self.specialized = shapes is not None
+        self.pipeline_count = len(shape_names)
         w = self.p["weights"]
         # real work is never inside an assert: python -O would skip it (Codex audit 2026-10-14)
-        ret = self.lib.yg_init(os.path.join(HERE, "shaders").encode(), names, len(SHADERS),
-                               ctypes.c_long(self.p["arena_floats"]), w.ctypes.data_as(ctypes.c_void_p),
-                               ctypes.c_long(w.size))
+        init_args = (os.path.join(HERE, "shaders").encode(), names, len(shape_names),
+                     ctypes.c_long(self.p["arena_floats"]), w.ctypes.data_as(ctypes.c_void_p), ctypes.c_long(w.size))
+        ret = (self.lib.yg_init_shapes(*init_args, shapes.ctypes.data_as(ctypes.c_void_p))
+               if shapes is not None else self.lib.yg_init(*init_args))
         if ret == -100:
             raise RuntimeError("libygpu.so already in use: only one A4AGPU per process")
         if ret != 0:
@@ -1553,9 +1589,8 @@ class A4AGPU:
         for a, arr in self.p["init"]:                    # small constants live in the arena
             self.arena[a:a + arr.size] = arr
         self.par = 0                                     # which plan runs next (rings: A/B swap every step)
-        plans = [self.p] + ([self.c.plan(swap=True)] if self.c.rings else [])
         for s, pl in enumerate(plans):
-            pipe, push, groups = pl["pipe"], pl["push"], pl["groups"]
+            pipe, push, groups = run_pipes[s], pl["push"], pl["groups"]
             if self.c.rings and self.lib.yg_slot(s) != 0:
                 raise RuntimeError("libygpu.so has no second plan slot (rebuild it)")
             if self.lib.yg_plan(len(pipe), pipe.ctypes.data_as(ctypes.c_void_p), push.ctypes.data_as(ctypes.c_void_p),

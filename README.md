@@ -129,11 +129,16 @@ One `A4AGPU` per process: `libygpu.so` keeps one Vulkan context, and a second on
 - The ~63 cache writes at the end of every step (each history and the attention cache) run as one job that works
   through a table of copies, instead of 63 small jobs that each cost ~0.08 ms just to start. 412 -> 350 jobs,
   about 1.5% faster, bit-identical (`A4A_COPYN=0` = separate jobs).
+- The matrix and depthwise-conv shaders get each job's fixed sizes, strides and operation baked in when the
+  pipeline is created (Vulkan specialization constants; buffer addresses stay as push constants), so the
+  compiler can simplify the indexing and loops. 45 -> 61 pipelines, about 3.5% faster, bit-identical
+  (`A4A_SPECIALIZE=0` = generic shaders). The first start after building compiles them (~30 s); later
+  starts use the driver's shader cache.
 - 256 threads per workgroup throughout. On this GPU that was worth more than any shader rewrite.
 - No fp16 or int8 on this GPU, so everything is f32.
 
 Most of each step (~75%) is the matrix work, already close to what this GPU can do. Things tried that did
-not help: other tile shapes, uniform weight reads (5–8x slower), elementwise vec4 stores (<1%), fewer
+not help: a softmax that computes each exponential once, other tile shapes, uniform weight reads (5–8x slower), elementwise vec4 stores (<1%), fewer
 pipeline barriers, folding the attention's Add+Mul into the matrix job, splitting the narrow matrix jobs
 across more threads (split-K) or giving them smaller tiles.
 

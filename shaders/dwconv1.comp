@@ -6,19 +6,20 @@
 // 256-thread groups: 2026-10-13 sweep, 64 -> 256 took a step 568 -> 524 ms (A4A_LS in a4a_gpu.py must match)
 layout(local_size_x = 256) in;
 #include "common.glsl"
+#include "specialization.glsl"
 int Tin, xb, xr;
 vec4 X(int t) { return (t >= 0 && t < Tin) ? a4[xb + t * xr] : vec4(0.0); }
 #define TAP(j, xa, xb_, xc, xd) { vec4 wv = w4[wb + uint(j) * C4]; s0 += wv * xa; s1 += wv * xb_; s2 += wv * xc; s3 += wv * xd; }
 void main() {
-    uint C4 = p.u[0] / 4u, T = p.u[1], q4 = (T + 3u) / 4u, i = tid();
+    uint C4 = U(0) / 4u, T = U(1), q4 = (T + 3u) / 4u, i = tid();
     if (i >= C4 * q4) return;
     uint c4 = i % C4, t0 = (i / C4) * 4u;
-    Tin = int(p.u[6]); xr = int(p.u[8]) / 4; xb = int(p.u[7]) / 4 + int(c4);
+    Tin = int(U(6)); xr = int(U(8)) / 4; xb = int(p.u[7]) / 4 + int(c4);
     uint wb = p.u[9] / 4u + c4;
-    int K = int(p.u[2]);
-    vec4 b = w4[p.u[10] / 4u + c4];
+    int K = int(U(2));
+    vec4 b = w4[U(10) / 4u + c4];
     vec4 s0 = b, s1 = b, s2 = b, s3 = b;
-    int tt = int(t0) - int(p.u[5]);
+    int tt = int(t0) - int(U(5));
     vec4 x0 = X(tt), x1 = X(tt + 1), x2 = X(tt + 2), x3;
     int j = 0;
     for (; j + 4 <= K; j += 4) {
@@ -31,19 +32,19 @@ void main() {
         x3 = X(tt + j + 3); TAP(j, x0, x1, x2, x3)
         x0 = x1; x1 = x2; x2 = x3;
     }
-    uint op = p.u[14];
+    uint op = U(14);
     s0 = epi4(s0, op); s1 = epi4(s1, op); s2 = epi4(s2, op); s3 = epi4(s3, op);
 #ifdef POST
     {   // -DPOST: 19 R, 20 sRc, 21 sRt, 22 op (1 out + R, 2 out / R); folds an Add / Div job in (2026-10-14)
-        int rb = int(p.u[19]), rc = int(p.u[20]), rt = int(p.u[21]);
-        bool dv = p.u[22] == 2u;
+        int rb = int(U(19)), rc = int(U(20)), rt = int(U(21));
+        bool dv = U(22) == 2u;
 #define RV(k) { int r = rb + int(c4 * 4u) * rc + int(min(t0 + uint(k), T - 1u)) * rt; \
         vec4 R = vec4(a[r], a[r + rc], a[r + 2 * rc], a[r + 3 * rc]); s##k = dv ? s##k / R : s##k + R; }
         RV(0) RV(1) RV(2) RV(3)
     }
 #endif
-    int ob = int(p.u[11]), sOc = int(p.u[12]), sOt = int(p.u[13]);
-    if (p.u[15] == 1u) {                                 // channels-last output: vec4 stores
+    int ob = int(U(11)), sOc = int(U(12)), sOt = int(U(13));
+    if (U(15) == 1u) {                                 // channels-last output: vec4 stores
         int o = ob / 4 + int(c4) + int(t0) * (sOt / 4);
         a4[o] = s0;
         if (t0 + 1u < T) a4[o + sOt / 4] = s1;

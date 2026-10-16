@@ -20,3 +20,6 @@ shaders/dwconvp.spv: shaders/dwconv.comp shaders/common.glsl
 	glslc --target-env=vulkan1.1 -O -DPOST $< -o $@
 shaders/dwconv1p.spv: shaders/dwconv1.comp shaders/common.glsl
 	glslc --target-env=vulkan1.1 -O -DPOST $< -o $@
+
+# Specialization defaults retain the generic shaders; only shape fields are fixed.
+$(filter shaders/gemm12%.spv shaders/dwconv%.spv,$(SHADERS:%=shaders/%.spv)): shaders/specialization.glsl

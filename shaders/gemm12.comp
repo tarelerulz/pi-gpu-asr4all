@@ -8,18 +8,19 @@
 //   out strides) = v * S[n] + T[n] (a BatchNorm of the result, also kept) | 17 S, 18 T, 19 sSn, 20 sTn
 layout(local_size_x = 256) in;
 #include "common.glsl"
+#include "specialization.glsl"
 #define LDA(base, idx) a[int(base) + (idx)]
 #define ACC(j, wv, c) s##j += wv.c * x;
 void main() {
-    uint M = p.u[0], N = p.u[1], K = p.u[2], NP = p.u[3], q4 = (M + 3u) / 4u, i = tid();
+    uint M = U(0), N = U(1), K = U(2), NP = U(3), q4 = (M + 3u) / 4u, i = tid();
     if (i >= (NP / 12u) * q4) return;
     uint cg = i / q4, q = i % q4, m0 = q * 4u;
-    int sAm = int(p.u[5]), sAk = int(p.u[6]);
-    uint Ab = p.u[4];
+    int sAm = int(U(5)), sAk = int(U(6));
+    uint Ab = U(4);
     int a0 = int(min(m0, M - 1u)) * sAm, a1 = int(min(m0 + 1u, M - 1u)) * sAm;
     int a2 = int(min(m0 + 2u, M - 1u)) * sAm, a3 = int(min(m0 + 3u, M - 1u)) * sAm;
     vec4 b0 = vec4(0.0), b1 = vec4(0.0), b2 = vec4(0.0);
-    if (p.u[8] != 0xffffffffu) { uint bo = p.u[8] / 4u + cg * 3u; b0 = w4[bo]; b1 = w4[bo + 1u]; b2 = w4[bo + 2u]; }
+    if (U(8) != 0xffffffffu) { uint bo = U(8) / 4u + cg * 3u; b0 = w4[bo]; b1 = w4[bo + 1u]; b2 = w4[bo + 2u]; }
     vec4 s0 = vec4(b0.x), s1 = vec4(b0.y), s2 = vec4(b0.z), s3 = vec4(b0.w);
     vec4 s4 = vec4(b1.x), s5 = vec4(b1.y), s6 = vec4(b1.z), s7 = vec4(b1.w);
     vec4 s8 = vec4(b2.x), s9 = vec4(b2.y), s10 = vec4(b2.z), s11 = vec4(b2.w);
@@ -36,10 +37,10 @@ void main() {
         ACC(4, w1, x) ACC(5, w1, y) ACC(6, w1, z) ACC(7, w1, w)
         ACC(8, w2, x) ACC(9, w2, y) ACC(10, w2, z) ACC(11, w2, w)
     }
-    uint ob = p.u[9], op = p.u[12];
-    int sOm = int(p.u[10]), sOn = int(p.u[11]);
+    uint ob = p.u[9], op = U(12);
+    int sOm = int(U(10)), sOn = int(U(11));
 #ifdef POST
-    int dR = int(p.u[13]) - int(ob);
+    int dR = int(U(13)) - int(ob);
 #define R4(o) + a4[(o) + dR / 4]
 #define R1(o) + a[(o) + dR]
 #else
@@ -56,14 +57,14 @@ void main() {
 #else
 #if OV4
 #ifdef POST
-    uint pm = p.u[14];
+    uint pm = U(14);
     int d2 = int(p.u[16]) - int(ob);
     bool o2 = p.u[16] != 0xffffffffu;
 #define PUT(j, J) { uint n = cg * 12u + J; if (n < N) { int o = (int(ob) + int(n) * sOn) / 4 + int(q); \
     vec4 v = epi4(s##j, op); \
     if (pm == 1u) v = v + a4[o + dR / 4]; \
     a4[o] = v; \
-    if (o2) a4[o + d2 / 4] = v * a[int(p.u[17]) + int(n) * int(p.u[19])] + a[int(p.u[18]) + int(n) * int(p.u[20])]; } }
+    if (o2) a4[o + d2 / 4] = v * a[int(p.u[17]) + int(n) * int(U(19))] + a[int(p.u[18]) + int(n) * int(U(20))]; } }
 #else
 #define PUT(j, J) { uint n = cg * 12u + J; if (n < N) a4[(int(ob) + int(n) * sOn) / 4 + int(q)] = epi4(s##j, op); }
 #endif

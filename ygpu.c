@@ -54,23 +54,29 @@ static int buf_new(Buf *b, size_t size, int want_cached) {
     return 0;
 }
 
-static int pipe_new(const char *dir, const char *name, VkPipeline *out) {
+static int pipe_new(const char *dir, const char *name, const uint32_t *shape, VkPipeline *out) {
     char path[512]; snprintf(path, sizeof path, "%s/%s.spv", dir, name);
     FILE *f = fopen(path, "rb"); if (!f) { perror(path); return -1; }
     fseek(f, 0, SEEK_END); long len = ftell(f); rewind(f);
     uint32_t *code = malloc(len); if (fread(code, 1, len, f) != (size_t)len) { fclose(f); free(code); return -1; } fclose(f);
     VkShaderModuleCreateInfo sm = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = len, .pCode = code };
     VkShaderModule mod; CK(vkCreateShaderModule(dev, &sm, NULL, &mod));
+    VkSpecializationMapEntry entries[32];
+    for (uint32_t i = 0; i < 32; i++)
+        entries[i] = (VkSpecializationMapEntry){ .constantID = i, .offset = i * sizeof(uint32_t), .size = sizeof(uint32_t) };
+    VkSpecializationInfo si = { .mapEntryCount = 32, .pMapEntries = entries,
+        .dataSize = 32 * sizeof(uint32_t), .pData = shape };
     VkComputePipelineCreateInfo cp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = layout,
-        .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = mod, .pName = "main" } };
+        .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = mod, .pName = "main", .pSpecializationInfo = shape ? &si : NULL } };
     CK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cp, NULL, out));
     vkDestroyShaderModule(dev, mod, NULL); free(code);
     return 0;
 }
 
-int yg_init(const char *shader_dir, const char **names, int n_names, long arena_floats, const float *weights, long n_weights) {
+static int init(const char *shader_dir, const char **names, int n_names, long arena_floats,
+                const float *weights, long n_weights, const uint32_t *shapes) {
     if (dev) return -100;                        /* one context per process: all state below is global */
-    if (n_names > MAXP) return -1;
+    if (n_names <= 0 || n_names > MAXP) return -1;
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "ygpu", .apiVersion = VK_API_VERSION_1_1 };
     VkInstanceCreateInfo ic = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
     CK(vkCreateInstance(&ic, NULL, &inst));
@@ -98,7 +104,7 @@ int yg_init(const char *shader_dir, const char **names, int n_names, long arena_
     VkPushConstantRange pr = { .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .size = 32 * 4 };
     VkPipelineLayoutCreateInfo pl = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr };
     CK(vkCreatePipelineLayout(dev, &pl, NULL, &layout));
-    for (int i = 0; i < n_names; i++) if (pipe_new(shader_dir, names[i], &pipes[i])) return -1;
+    for (int i = 0; i < n_names; i++) if (pipe_new(shader_dir, names[i], shapes ? shapes + (size_t)i * 32 : NULL, &pipes[i])) return -1;
     npipes = n_names;
 
     if (buf_new(&arena, (size_t)arena_floats * 4, 1) || buf_new(&wts, (size_t)(n_weights > 0 ? n_weights : 1) * 4, 0)) return -1;
@@ -118,6 +124,16 @@ int yg_init(const char *shader_dir, const char **names, int n_names, long arena_
         vkUpdateDescriptorSets(dev, 1, &w, 0, NULL);
     }
     return 0;
+}
+
+/* Keep the original ABI for callers that do not specialize pipelines. */
+int yg_init(const char *dir, const char **names, int count, long arena_floats, const float *weights, long n_weights) {
+    return init(dir, names, count, arena_floats, weights, n_weights, NULL);
+}
+
+int yg_init_shapes(const char *dir, const char **names, int count, long arena_floats,
+                   const float *weights, long n_weights, const uint32_t *shapes) {
+    return init(dir, names, count, arena_floats, weights, n_weights, shapes);
 }
 
 void *yg_arena(void) { return arena.map; }
