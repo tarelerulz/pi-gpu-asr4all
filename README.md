@@ -7,18 +7,19 @@ shaders. The words come out the same as the normal CPU version, but the CPU is l
 The GPU is **not faster** than the CPU here. What you get is a free CPU: dictation keeps up with speech
 while the CPU stays available for everything else.
 
-## Results (Pi 400, GPU at the default 500 MHz)
+## Results (Pi 400)
 
-| | CPU (onnxruntime) | GPU (this repo) |
-|---|---|---|
-| Text on 32 real dictation clips (218 s of speech) | — | identical to the CPU on 32/32 |
-| Time for those 218 s of speech | ~130 s | ~178 s (0.82x real time) |
-| CPU time used for them | ~490 s | ~45 s |
-| CPU while you talk (live dictation, 2 threads) | ~1 core | ~0.15 core |
-| One model step (0.64 s of audio) | 359 ms (3 threads) | ~473 ms |
+| | CPU (onnxruntime, 3 threads) | GPU, default 500 MHz | GPU at 600 MHz |
+|---|---|---|---|
+| Text on 31 real dictation clips (208 s of speech) | — | identical to the CPU on 31/31 | identical on 31/31 |
+| Time for those 208 s of speech | ~120 s | ~162 s (0.78x real time) | ~151 s (0.73x real time) |
+| CPU time used for them | ~280 s | ~15 s | ~16 s |
+| CPU while you talk (live dictation, 2 threads) | ~1 core | ~0.15 core | ~0.15 core |
+| One model step (0.64 s of audio) | 359 ms | ~456 ms | ~422 ms |
 
 Accuracy check: log-probabilities within ~3e-5 of onnxruntime, the same best token on every frame.
-Raising the GPU clock to 600 MHz (`v3d_freq=600` in config.txt) gave about 5–7% more speed; 550 MHz gave nothing.
+Raising the GPU clock to 600 MHz (`v3d_freq=600` in /boot/config.txt, then reboot) gives about 7% more speed
+and the same text; 550 MHz gave nothing measurable.
 
 ## What you need
 
@@ -137,7 +138,7 @@ One `A4AGPU` per process: `libygpu.so` keeps one Vulkan context, and a second on
 - 256 threads per workgroup throughout. On this GPU that was worth more than any shader rewrite.
 - No fp16 or int8 on this GPU, so everything is f32.
 
-Most of each step (~75%) is the matrix work, already close to what this GPU can do. Things tried that did
+Most of each step (~82%) is the matrix work, already close to what this GPU can do. Things tried that did
 not help: a softmax that computes each exponential once, other tile shapes, uniform weight reads (5–8x slower), elementwise vec4 stores (<1%), fewer
 pipeline barriers, folding the attention's Add+Mul into the matrix job, splitting the narrow matrix jobs
 across more threads (split-K) or giving them smaller tiles.
