@@ -104,7 +104,26 @@ finally:
     engine.model.run_stream = gpu_run         # next step loads the numpy caches back onto the GPU
 ```
 
-One `A4AGPU` per process: `libygpu.so` keeps one Vulkan context, and a second one is refused.
+All-GPU alternative: `use_gpu(engine, tail="stream_c32r8")` also puts the c32r8 tier on the GPU, in the same
+context (its own weights, the shared cache layout, the state copied across in ~16 ms). Finish the phrase with one
+c32r8 step for the last 17-32 frames instead of two c16r4 steps: the end of a phrase is ~80 ms sooner
+(893 vs 972 ms median on 31 clips at 600 MHz); text identical on 30/31 (one mumbled word changed). Costs ~205 MB
+more RAM and a longer first start.
+
+```python
+a4a_gpu.use_gpu(engine, tail="stream_c32r8")
+tail = next(t for t in engine.tiers if t["name"] == "stream_c32r8")
+...                                           # at the end of a phrase, instead of engine.finish():
+t16 = engine.tiers[engine.idx]
+while engine.next_frame * engine.spf < len(engine.pcm):
+    left = -(-len(engine.pcm) // engine.spf) - engine.next_frame
+    engine._step(tail if 16 < left <= 32 else t16)
+engine.pcec.flush()
+engine.pcec.drain()
+text = engine.decode_pcec(decode_tail=True)
+```
+
+One `A4AGPU` per process: `libygpu.so` keeps one Vulkan context (several tiers can share it, as above), and a second one is refused.
 
 ## How it works
 

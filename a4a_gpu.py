@@ -233,6 +233,8 @@ class Compiler:
                 self.consts[n.output[0]] = numpy_helper.to_array(n.attribute[0].t)
         self.inputs = [i.name for i in g.input]
         self.outputs = [o.name for o in g.output]
+        # frames committed per step (log_probs rows): 16 for stream_c16r4, 32 for c32r8 (row trim keeps these)
+        self.commit = next(self.shapes[o][1] for o in self.outputs if o.endswith("log_probs"))
         self.consumers = {}
         for n in self.nodes:
             for x in n.input:
@@ -1493,8 +1495,8 @@ class Compiler:
         for i, j in enumerate(self.jobs):
             u = j["u"]
             base = j["label"].split(" +")[0].split(" ->")[0]
-            if trim and j["pipe"].startswith("gemm12") and base in ROW_TRIM and ROW_TRIM[base] < u[0]:
-                m = ROW_TRIM[base]
+            m = ROW_TRIM.get(base, 16) * self.commit // 16      # c32r8: 32 rows (16 gave wrong output)
+            if trim and j["pipe"].startswith("gemm12") and base in ROW_TRIM and m < u[0]:
                 u = [m] + list(u[1:])
                 groups[i] = groups_for((u[3] // 12) * ((m + 3) // 4))
                 self.trimmed += 1
@@ -1544,15 +1546,17 @@ def _pipeline_shapes(plans):
                 shapes.append(shape)
             indices.append(seen[key])
         pipes.append(np.asarray(indices, np.int32))
-    if len(names) > 64:                  # preserve the runner's MAXP limit for other graphs
+    if len(names) > 160:                 # preserve the runner's MAXP limit for other graphs
         return SHADERS, None, [p["pipe"] for p in plans]
     return names, np.asarray(shapes, np.uint32), pipes
 
 
 class A4AGPU:
     """One stream graph on the GPU. step(pcm, filter_cache=None, attn_cache=None) -> (log_probs, hidden).
-    Caches stay on the GPU; pass numpy caches only to (re)load state (reset / restore)."""
-    def __init__(self, path=os.path.join(ONNX_DIR, "stream_c16r4.onnx"), debug=False):
+    Caches stay on the GPU; pass numpy caches only to (re)load state (reset / restore).
+    extra=[paths]: more tiers in the same GPU context (own weights + arena part), as self.extra[i];
+    move_state(dst) hands the caches over raw (all tiers share one cache layout)."""
+    def __init__(self, path=os.path.join(ONNX_DIR, "stream_c16r4.onnx"), debug=False, extra=()):
         for lib in ("libwayland-client.so.0", "libxshmfence.so.1", "libvulkan.so.1") if VK else ():
             try:
                 ctypes.CDLL(os.path.join(VK, "lib", lib), mode=ctypes.RTLD_GLOBAL)
@@ -1562,12 +1566,18 @@ class A4AGPU:
         if os.path.exists(icd):                          # else the system's Vulkan driver list (Raspberry Pi OS)
             os.environ.setdefault("VK_ICD_FILENAMES", icd)
         t = time.time()
-        self.c = Compiler(path, debug)
-        self.p = self.c.plan()
+        tiers = [self] + [object.__new__(A4AGPU) for _ in extra]
+        base = 0
+        for g, pth in zip(tiers, [path, *extra]):
+            g.c = Compiler(pth, debug)
+            g.p = g.c.plan()
+            g.base = base                                # this tier's arena part starts here (floats)
+            base += (g.p["arena_floats"] + 255) // 256 * 256
         self.build_s = time.time() - t
         self.lib = ctypes.CDLL(os.path.join(HERE, "libygpu.so"))
         self.lib.yg_arena.restype = ctypes.c_void_p
-        plans = [self.p] + ([self.c.plan(swap=True)] if self.c.rings else [])
+        plans_of = [[g.p] + ([g.c.plan(swap=True)] if g.c.rings else []) for g in tiers]
+        plans = [pl for ps in plans_of for pl in ps]
         shape_names, shapes, run_pipes = SHADERS, None, [p["pipe"] for p in plans]
         if os.environ.get("A4A_SPECIALIZE", "1") != "0" and hasattr(self.lib, "yg_init_shapes"):
             shape_names, shapes, run_pipes = _pipeline_shapes(plans)
@@ -1577,28 +1587,71 @@ class A4AGPU:
         w = self.p["weights"]
         # real work is never inside an assert: python -O would skip it (Codex audit 2026-10-14)
         init_args = (os.path.join(HERE, "shaders").encode(), names, len(shape_names),
-                     ctypes.c_long(self.p["arena_floats"]), w.ctypes.data_as(ctypes.c_void_p), ctypes.c_long(w.size))
+                     ctypes.c_long(base), w.ctypes.data_as(ctypes.c_void_p), ctypes.c_long(w.size))
         ret = (self.lib.yg_init_shapes(*init_args, shapes.ctypes.data_as(ctypes.c_void_p))
                if shapes is not None else self.lib.yg_init(*init_args))
         if ret == -100:
             raise RuntimeError("libygpu.so already in use: only one A4AGPU per process")
         if ret != 0:
             raise RuntimeError(f"yg_init failed ({ret})")
-        self.arena = np.ctypeslib.as_array(ctypes.cast(self.lib.yg_arena(), ctypes.POINTER(ctypes.c_float)),
-                                           shape=(self.p["arena_floats"],))
-        for a, arr in self.p["init"]:                    # small constants live in the arena
-            self.arena[a:a + arr.size] = arr
-        self.par = 0                                     # which plan runs next (rings: A/B swap every step)
-        for s, pl in enumerate(plans):
-            pipe, push, groups = run_pipes[s], pl["push"], pl["groups"]
-            if self.c.rings and self.lib.yg_slot(s) != 0:
-                raise RuntimeError("libygpu.so has no second plan slot (rebuild it)")
-            if self.lib.yg_plan(len(pipe), pipe.ctypes.data_as(ctypes.c_void_p), push.ctypes.data_as(ctypes.c_void_p),
-                                groups.ctypes.data_as(ctypes.c_void_p)) != 0:
-                raise RuntimeError("yg_plan failed")
-        if self.c.rings:
-            self.lib.yg_slot(0)
-        self.gpu_ms = 0.0
+        whole = np.ctypeslib.as_array(ctypes.cast(self.lib.yg_arena(), ctypes.POINTER(ctypes.c_float)), shape=(base,))
+        slot = 0
+        for k, g in enumerate(tiers):
+            if k and not hasattr(self.lib, "yg_add_set"):
+                raise RuntimeError("libygpu.so has no second graph (rebuild it)")
+            if k:
+                wk = g.p["weights"]
+                if self.lib.yg_add_set(wk.ctypes.data_as(ctypes.c_void_p), ctypes.c_long(wk.size),
+                                       ctypes.c_long(g.base)) != k:
+                    raise RuntimeError("yg_add_set failed")
+                self.lib.yg_set(k)
+            g.lib, g.set = self.lib, k
+            g.arena = whole[g.base:g.base + g.p["arena_floats"]]
+            for a, arr in g.p["init"]:                   # small constants live in the arena
+                g.arena[a:a + arr.size] = arr
+            g.par = 0                                    # which plan runs next (rings: A/B swap every step)
+            g.slots = []
+            for pl in plans_of[k]:
+                pipe, push, groups = run_pipes[slot], pl["push"], pl["groups"]
+                if self.lib.yg_slot(slot) != 0:
+                    raise RuntimeError("libygpu.so has too few plan slots (rebuild it)")
+                if self.lib.yg_plan(len(pipe), pipe.ctypes.data_as(ctypes.c_void_p), push.ctypes.data_as(ctypes.c_void_p),
+                                    groups.ctypes.data_as(ctypes.c_void_p)) != 0:
+                    raise RuntimeError("yg_plan failed")
+                g.slots.append(slot)
+                slot += 1
+            g.gpu_ms = 0.0
+        self.lib.yg_slot(0)
+        self.extra = tiers[1:]
+
+    def same_layout(self, other):
+        """True when both tiers keep the caches in the same GPU layout, so move_state can copy them raw."""
+        a, b = self.c, other.c
+        if [(r["off"], r["n"]) for r in a.rings] != [(r["off"], r["n"]) for r in b.rings]:
+            return False
+        for which in ("filter_cache", "attn_cache"):
+            if a.in_views[which].size() != b.in_views[which].size():
+                return False
+            probe = np.arange(a.in_views[which].size(), dtype=np.float32)
+            if not np.array_equal(a.to_internal(which, probe), b.to_internal(which, probe)):
+                return False
+        return True
+
+    def move_state(self, dst):
+        """Copy this tier's live caches (its next step's ring history) into tier dst, in the GPU layout.
+        filter_cache's ring slots are skipped: the step reads those from the ring buffers (~88% of it)."""
+        if not hasattr(self, "_fc_parts"):
+            cut, at = [], 0
+            for r in sorted(self.c.rings, key=lambda r: r["off"]):
+                cut.append((at, r["off"]))
+                at = r["off"] + r["n"]
+            self._fc_parts = [(a, b) for a, b in cut + [(at, self.c.in_views["filter_cache"].size())] if b > a]
+        fs, fd = self.region("filter_cache"), dst.region("filter_cache")
+        for a, b in self._fc_parts:
+            fd[a:b] = fs[a:b]
+        dst.region("attn_cache")[:] = self.region("attn_cache")
+        for rs, rd in zip(self.c.rings, dst.c.rings):
+            dst._ring_rows(rd)[:] = self._ring_rows(rs)
 
     def region(self, name):
         v = self.c.in_views[name]
@@ -1657,8 +1710,7 @@ class A4AGPU:
         self.region(self.c.pcm_name)[:] = np.asarray(pcm, np.float32).ravel()
         self._host()
         t = ctypes.c_double()
-        if self.c.rings:
-            self.lib.yg_slot(self.par)
+        self.lib.yg_slot(self.slots[self.par])
         if self.lib.yg_run(ctypes.byref(t)) != 0:
             raise RuntimeError("yg_run failed")
         if self.c.rings:
@@ -1685,19 +1737,33 @@ class GpuCache:
         return self.g.cache(self.which)
 
 
-def use_gpu(engine, tier="stream_c16r4"):
-    """Run `tier` of a FUTO asr4all_onnx Engine (asr4all-m) on the GPU; other tiers and PCEC stay on the CPU."""
-    g = A4AGPU()
-    names = list(g.c.out_views)
-    lp = next(n for n in names if n.endswith("log_probs"))
-    hid = next(n for n in names if n.endswith("hidden"))
+def use_gpu(engine, tier="stream_c16r4", tail=None):
+    """Run `tier` of a FUTO asr4all_onnx Engine (asr4all-m) on the GPU; other tiers and PCEC stay on the CPU.
+    tail="stream_c32r8": that tier on the GPU too (same context), for the end-of-phrase tail; the caches
+    move across raw when the engine switches tiers."""
+    g = A4AGPU(os.path.join(ONNX_DIR, tier + ".onnx"), extra=[os.path.join(ONNX_DIR, tail + ".onnx")] if tail else ())
+    gpus = {tier: g}
+    if tail:
+        if not g.same_layout(g.extra[0]):
+            raise RuntimeError(f"{tier} and {tail} keep the caches in different GPU layouts")
+        gpus[tail] = g.extra[0]
+    outs_of = {}
+    for name, gt in gpus.items():
+        names = list(gt.c.out_views)
+        outs_of[name] = (next(n for n in names if n.endswith("log_probs")), next(n for n in names if n.endswith("hidden")))
     orig = engine.model.run_stream
 
     def run_stream(t, win, fc, ac):
-        if t["name"] != tier:
+        gt = gpus.get(t["name"])
+        if gt is None:
             return orig(t, win, fc, ac)
-        outs = g.step(win, None if isinstance(fc, GpuCache) else fc, None if isinstance(ac, GpuCache) else ac)
-        return [outs[lp], GpuCache(g, "filter_cache"), GpuCache(g, "attn_cache"), outs[hid]]
+        if isinstance(fc, GpuCache) and fc.g is not gt:
+            fc.g.move_state(gt)                          # state is on the GPU, in the other tier's part
+        if isinstance(ac, GpuCache) and ac.g is not gt and not isinstance(fc, GpuCache):
+            ac.g.move_state(gt)
+        outs = gt.step(win, None if isinstance(fc, GpuCache) else fc, None if isinstance(ac, GpuCache) else ac)
+        lp, hid = outs_of[t["name"]]
+        return [outs[lp], GpuCache(gt, "filter_cache"), GpuCache(gt, "attn_cache"), outs[hid]]
     engine.model.run_stream = run_stream
     return g
 

@@ -9,6 +9,8 @@
  *   yg_plan(n, pipe, push[n*32], groups[n*3])   record the job list once (with timestamps between jobs)
  *   yg_run(&gpu_ms)                    submit the recorded list, wait
  *   yg_times(ms[n])                    per-job GPU time of the last run, from timestamps
+ *   yg_add_set(weights, n, arena_off)  a second graph in the same context: own weights buffer, arena from
+ *                                      arena_off floats on; yg_set(k) picks the set the next yg_plan binds
  * Build: make lib   (links the system Vulkan loader, or VK=/dir/with/libvulkan.so)
  */
 #include <stdint.h>
@@ -19,17 +21,19 @@
 #include <vulkan/vulkan.h>
 
 #define CK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { fprintf(stderr, "ygpu: %s failed: %d (line %d)\n", #x, r_, __LINE__); return -1; } } while (0)
-#define MAXP 64
+#define MAXP 160
+#define MAXS 4                                   /* plan slots: 2 graphs x 2 ring parities */
 
 typedef struct { VkBuffer buf; VkDeviceMemory mem; void *map; size_t size; } Buf;
 
 static VkInstance inst; static VkPhysicalDevice phys; static VkDevice dev; static VkQueue queue;
-static VkCommandPool pool; static VkCommandBuffer cb, cbs[2]; static VkPhysicalDeviceMemoryProperties memprops;
-static int qcount;
-static VkDescriptorSetLayout dsl; static VkPipelineLayout layout; static VkDescriptorPool dpool; static VkDescriptorSet set;
+static VkCommandPool pool; static VkCommandBuffer cb, cbs[MAXS]; static VkPhysicalDeviceMemoryProperties memprops;
+static VkDescriptorSetLayout dsl; static VkPipelineLayout layout; static VkDescriptorPool dpool;
+static VkDescriptorSet sets[MAXS]; static int nsets, cur_set;
 static VkPipeline pipes[MAXP]; static int npipes;
-static VkQueryPool qpool; static int njobs; static float ts_period = 1.0f;
-static Buf arena, wts;
+/* one timestamp pool per slot: growing a shared pool would invalidate the other slots' recorded buffers */
+static VkQueryPool qpools[MAXS]; static int qcounts[MAXS], njobs_s[MAXS], cur; static float ts_period = 1.0f;
+static Buf arena, wts[MAXS]; static VkDeviceSize ssbo_align = 1;
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
@@ -73,6 +77,8 @@ static int pipe_new(const char *dir, const char *name, const uint32_t *shape, Vk
     return 0;
 }
 
+int yg_add_set(const float *weights, long n_weights, long arena_off);
+
 static int init(const char *shader_dir, const char **names, int n_names, long arena_floats,
                 const float *weights, long n_weights, const uint32_t *shapes) {
     if (dev) return -100;                        /* one context per process: all state below is global */
@@ -83,6 +89,7 @@ static int init(const char *shader_dir, const char **names, int n_names, long ar
     uint32_t n = 1; vkEnumeratePhysicalDevices(inst, &n, &phys);
     if (n == 0) { fprintf(stderr, "ygpu: no Vulkan GPU\n"); return -1; }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(phys, &props); ts_period = props.limits.timestampPeriod;
+    ssbo_align = props.limits.minStorageBufferOffsetAlignment;
     uint32_t nq = 8, qfam = 0; VkQueueFamilyProperties qp[8]; vkGetPhysicalDeviceQueueFamilyProperties(phys, &nq, qp);
     while (qfam < nq && !(qp[qfam].queueFlags & VK_QUEUE_COMPUTE_BIT)) qfam++;
     float prio = 1.0f;
@@ -92,7 +99,7 @@ static int init(const char *shader_dir, const char **names, int n_names, long ar
     vkGetDeviceQueue(dev, qfam, 0, &queue);
     VkCommandPoolCreateInfo pc = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = qfam, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT };
     CK(vkCreateCommandPool(dev, &pc, NULL, &pool));
-    VkCommandBufferAllocateInfo ca = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 2 };
+    VkCommandBufferAllocateInfo ca = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = MAXS };
     CK(vkAllocateCommandBuffers(dev, &ca, cbs));
     cb = cbs[0];
     vkGetPhysicalDeviceMemoryProperties(phys, &memprops);
@@ -107,22 +114,40 @@ static int init(const char *shader_dir, const char **names, int n_names, long ar
     for (int i = 0; i < n_names; i++) if (pipe_new(shader_dir, names[i], shapes ? shapes + (size_t)i * 32 : NULL, &pipes[i])) return -1;
     npipes = n_names;
 
-    if (buf_new(&arena, (size_t)arena_floats * 4, 1) || buf_new(&wts, (size_t)(n_weights > 0 ? n_weights : 1) * 4, 0)) return -1;
+    if (buf_new(&arena, (size_t)arena_floats * 4, 1)) return -1;
     memset(arena.map, 0, arena.size);
-    if (n_weights > 0) memcpy(wts.map, weights, (size_t)n_weights * 4);
 
-    VkDescriptorPoolSize ps = { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 };
-    VkDescriptorPoolCreateInfo dp = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps };
+    VkDescriptorPoolSize ps = { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 * MAXS };
+    VkDescriptorPoolCreateInfo dp = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = MAXS, .poolSizeCount = 1, .pPoolSizes = &ps };
     CK(vkCreateDescriptorPool(dev, &dp, NULL, &dpool));
+    return yg_add_set(weights, n_weights, 0) == 0 ? 0 : -1;
+}
+
+/* Weights buffer + descriptor set for one graph; its arena binding starts arena_off floats in, so the graph's own
+   offsets need no relocation. Returns the set index (0 = the one init made). */
+int yg_add_set(const float *weights, long n_weights, long arena_off) {
+    if (!dev || nsets >= MAXS) return -1;
+    VkDeviceSize off = (VkDeviceSize)arena_off * 4;
+    if (off % ssbo_align || off >= arena.size) { fprintf(stderr, "ygpu: arena offset %ld not aligned to %lu bytes\n", arena_off, (unsigned long)ssbo_align); return -1; }
+    int k = nsets;
+    if (buf_new(&wts[k], (size_t)(n_weights > 0 ? n_weights : 1) * 4, 0)) return -1;
+    if (n_weights > 0) memcpy(wts[k].map, weights, (size_t)n_weights * 4);
     VkDescriptorSetAllocateInfo da = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = dpool, .descriptorSetCount = 1, .pSetLayouts = &dsl };
-    CK(vkAllocateDescriptorSets(dev, &da, &set));
-    Buf *b[2] = { &arena, &wts };
+    CK(vkAllocateDescriptorSets(dev, &da, &sets[k]));
+    VkDescriptorBufferInfo bi[2] = { { .buffer = arena.buf, .offset = off, .range = VK_WHOLE_SIZE },
+                                     { .buffer = wts[k].buf, .range = VK_WHOLE_SIZE } };
     for (uint32_t i = 0; i < 2; i++) {
-        VkDescriptorBufferInfo bi = { .buffer = b[i]->buf, .range = VK_WHOLE_SIZE };
-        VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = i, .descriptorCount = 1,
-                                   .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi };
+        VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = sets[k], .dstBinding = i, .descriptorCount = 1,
+                                   .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i] };
         vkUpdateDescriptorSets(dev, 1, &w, 0, NULL);
     }
+    nsets++;
+    return k;
+}
+
+int yg_set(int k) {
+    if (k < 0 || k >= nsets) return -1;
+    cur_set = k;
     return 0;
 }
 
@@ -140,18 +165,19 @@ void *yg_arena(void) { return arena.map; }
 
 int yg_plan(int n, const int *pipe, const uint32_t *push, const uint32_t *groups) {
     int no_ts = getenv("YG_NO_TS") != NULL;   /* per-job timestamps off (they serialize the queue) */
-    if (n + 1 > qcount) {                     /* both slots' command buffers share the pool: only ever grow it */
-        if (qpool) { vkQueueWaitIdle(queue); vkDestroyQueryPool(dev, qpool, NULL); qpool = VK_NULL_HANDLE; }
+    if (n + 1 > qcounts[cur]) {
+        if (qpools[cur]) { vkQueueWaitIdle(queue); vkDestroyQueryPool(dev, qpools[cur], NULL); qpools[cur] = VK_NULL_HANDLE; }
         VkQueryPoolCreateInfo qi = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = n + 1 };
-        CK(vkCreateQueryPool(dev, &qi, NULL, &qpool));
-        qcount = n + 1;
+        CK(vkCreateQueryPool(dev, &qi, NULL, &qpools[cur]));
+        qcounts[cur] = n + 1;
     }
-    njobs = n;
+    VkQueryPool qpool = qpools[cur];
+    njobs_s[cur] = n;
     CK(vkResetCommandBuffer(cb, 0));
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     CK(vkBeginCommandBuffer(cb, &bi));
     vkCmdResetQueryPool(cb, qpool, 0, n + 1);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, NULL);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &sets[cur_set], 0, NULL);
     VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
                            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
     vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qpool, 0);
@@ -169,10 +195,11 @@ int yg_plan(int n, const int *pipe, const uint32_t *push, const uint32_t *groups
     return 0;
 }
 
-/* Two recorded plans (double-buffered conv histories, 2026-10-14): yg_slot picks the command buffer that the next
-   yg_plan records and yg_run submits. Slot 0 is the default, so single-plan callers are unchanged. */
+/* Recorded plans (double-buffered conv histories 2026-10-14; a second graph 2026-10-18): yg_slot picks the command
+   buffer that the next yg_plan records and yg_run submits. Slot 0 is the default, so single-plan callers are unchanged. */
 int yg_slot(int s) {
-    if (s < 0 || s > 1) return -1;
+    if (s < 0 || s >= MAXS) return -1;
+    cur = s;
     cb = cbs[s];
     return 0;
 }
@@ -187,8 +214,9 @@ int yg_run(double *gpu_ms) {
 }
 
 int yg_times(double *ms) {
+    int njobs = njobs_s[cur];
     uint64_t *ts = malloc(sizeof(uint64_t) * (njobs + 1));
-    VkResult r = vkGetQueryPoolResults(dev, qpool, 0, njobs + 1, sizeof(uint64_t) * (njobs + 1), ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+    VkResult r = vkGetQueryPoolResults(dev, qpools[cur], 0, njobs + 1, sizeof(uint64_t) * (njobs + 1), ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
     if (r != VK_SUCCESS) { free(ts); return -1; }
     for (int i = 0; i < njobs; i++) ms[i] = (double)(ts[i + 1] - ts[i]) * ts_period * 1e-6;
     free(ts);
