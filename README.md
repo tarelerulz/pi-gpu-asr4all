@@ -25,8 +25,9 @@ and the same text; 550 MHz gave nothing measurable.
 
 - A Raspberry Pi 4 or Pi 400. The shaders are tuned for its GPU (V3D 4.2). Pi 5 has a different GPU: untested.
 - A 64-bit OS with Mesa's `v3dv` Vulkan driver. **Raspberry Pi OS (64-bit, Bookworm) ships it.**
-- About 1.1 GB of free RAM: that is the peak while the model is converted at startup (the CPU-only
-  version peaks at about 0.4 GB). A 4 GB Pi is fine; a 2 GB one is tight.
+- About 1.3 GB of free RAM: that is the peak while the model is converted at startup; it then holds about
+  0.95 GB (the CPU-only version peaks at about 0.4 GB). With the c32r8 tail tier (below) the peak is about
+  2.2 GB and it holds about 1.7 GB. A 4 GB Pi is fine; a 2 GB one is too small for the GPU version.
 
 Tested on a Pi 400 running Gentoo with Raspberry Pi OS's Vulkan driver (Mesa 25.0.7). Not yet tested on a
 fresh Raspberry Pi OS install; the steps below are what it should take.
@@ -107,8 +108,9 @@ finally:
 All-GPU alternative: `use_gpu(engine, tail="stream_c32r8")` also puts the c32r8 tier on the GPU, in the same
 context (its own weights, the shared cache layout, the state copied across in ~16 ms). Finish the phrase with one
 c32r8 step for the last 17-32 frames instead of two c16r4 steps: the end of a phrase is ~80 ms sooner
-(893 vs 972 ms median on 31 clips at 600 MHz); text identical on 30/31 (one mumbled word changed). Costs ~205 MB
-more RAM and a longer first start.
+(893 vs 972 ms median on 31 clips at 600 MHz); text identical on 30/31 (one mumbled word changed). Costs
+~0.9 GB more RAM at startup (peak ~2.2 GB instead of ~1.3 GB; ~1.7 GB held instead of ~0.95 GB) and a longer
+first start.
 
 ```python
 a4a_gpu.use_gpu(engine, tail="stream_c32r8")
