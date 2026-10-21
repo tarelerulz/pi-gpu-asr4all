@@ -15,6 +15,7 @@ Walk the ONNX graph once and turn it into a list of GPU jobs for libygpu.so
 Use:  python a4a_gpu.py --steps 6 [--profile] [--wav clip.wav]   compare with onnxruntime step by step + time it
 """
 import ctypes
+import gc
 import os
 import re
 import struct
@@ -1623,6 +1624,30 @@ class A4AGPU:
             g.gpu_ms = 0.0
         self.lib.yg_slot(0)
         self.extra = tiers[1:]
+        if os.environ.get("A4A_KEEP_BUILD", "0") != "1":
+            for g in tiers:
+                g._free_build_data()
+            gc.collect()
+            try:                                         # hand the freed heap back to the system (glibc)
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except (OSError, AttributeError):
+                pass
+
+    def _free_build_data(self):
+        """Drop what only the build needed. libygpu copied the weights into its GPU buffer (yg_add_set), so the
+        host copies and the graph maps would otherwise stay in RAM for nothing: ~0.3 GB held for the c16r4 tier,
+        ~0.75 GB with the c32r8 tail, same output. step() keeps what it uses: views, rings, jobs, and _host()'s
+        host_nodes with their attrs + consts. A4A_KEEP_BUILD=1 keeps everything (debugging)."""
+        c = self.c
+        self.weight_bytes = self.p["weights"].nbytes
+        self.p.pop("weights", None)
+        self.p.pop("init", None)
+        need = {x for n in c.host_nodes for x in n.input}
+        c.consts = {k: v for k, v in c.consts.items() if k in need}
+        c.attrs = {id(n): c.attrs[id(n)] for n in c.host_nodes}
+        for k in ("wparts", "wcache", "nodes", "consumers", "last_w", "init_data"):
+            if hasattr(c, k):
+                setattr(c, k, None)
 
     def same_layout(self, other):
         """True when both tiers keep the caches in the same GPU layout, so move_state can copy them raw."""
@@ -1775,7 +1800,7 @@ def _check(steps=6):
     g = A4AGPU(path, debug)
     c = g.c
     print(f"compiled in {g.build_s:.1f} s: {len(c.jobs)} jobs, {len(c.host_nodes)} host nodes "
-          f"({len(c.host_up)} uploads), arena {c.arena_floats * 4 / 1e6:.0f} MB, weights {g.p['weights'].nbytes / 1e6:.0f} MB")
+          f"({len(c.host_up)} uploads), arena {c.arena_floats * 4 / 1e6:.0f} MB, weights {(getattr(g, 'weight_bytes', 0) or g.p['weights'].nbytes) / 1e6:.0f} MB")
     from collections import Counter
     print("jobs:", dict(Counter(j["pipe"] for j in c.jobs)), "gemms into concat:", c.redirected)
     so = ort.SessionOptions()
